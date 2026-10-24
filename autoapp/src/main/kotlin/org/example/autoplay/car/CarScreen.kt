@@ -1,17 +1,15 @@
 ﻿package org.example.autoplay.car
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.Context
 import android.content.Intent
-import android.net.Uri
+import android.graphics.Bitmap
 import android.os.Build
-import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,6 +17,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -50,11 +49,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -68,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
+import org.example.autoplay.net.MediaAction
 import org.example.autoplay.session.SessionCode
 import org.example.autoplay.ui.AppColors
 import org.example.autoplay.ui.AppIcons
@@ -83,8 +85,22 @@ import org.example.autoplay.ui.Tone
 import org.example.autoplay.ui.VolumeSlider
 
 @Composable
-fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
+fun CarScreen(onBack: () -> Unit, onUseAsPhone: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
+    val liveState by viewModel.state.collectAsStateWithLifecycle()
+    // Demo: the dashboard with made-up phones and a song, to see it without connecting anything
+    var demo by rememberSaveable { mutableStateOf(false) }
+    val state = if (demo) remember(liveState) { demoState(liveState) } else liveState
+    val floating by NavigationMode.floating.collectAsStateWithLifecycle()
+    val activity = LocalContext.current as? Activity
+    // The play/pause button of the floating window follows the song
+    val songPlaying = state.track?.playing != false
+    LaunchedEffect(floating, songPlaying) {
+        if (floating) activity?.setPictureInPictureParams(NavigationMode.params(activity, songPlaying))
+    }
+    if (floating) {
+        MiniPlayer(state)
+        return
+    }
 
     // Only "Apagar" turns the car side off; Back just hides it so music and phones keep going
     val context = LocalContext.current
@@ -94,7 +110,6 @@ fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
     }
     val minimize: () -> Unit = { (context as? Activity)?.moveTaskToBack(true) }
     BackHandler(onBack = minimize)
-    LaunchedEffect(Unit) { askToSkipBatteryOptimization(context) }
     var renaming by remember { mutableStateOf(false) }
     if (renaming) RenameDialog(state.carName, onDismiss = { renaming = false }, onSave = {
         viewModel.rename(it)
@@ -121,6 +136,7 @@ fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
     val online = state.devices.count { it.online }
     val reconnecting = state.devices.size - online
     val (label, tone) = when {
+        demo -> "Demo" to Tone.Warning
         !state.running -> "Iniciando" to Tone.Neutral
         state.devices.isEmpty() -> "Esperando" to Tone.Progress
         online == 0 -> "Reconectando" to Tone.Warning
@@ -143,9 +159,10 @@ fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
     val fontScale = if (compact) density.fontScale else density.fontScale * CAR_FONT_SCALE
     CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
     Column(Modifier.fillMaxSize()) {
-        ScreenHeader(title = state.carName.ifEmpty { "Mi auto" }, subtitle = label.takeIf { compact }, onBack = minimize) {
+        ScreenHeader(title = state.carName.ifEmpty { "Mi auto" }, subtitle = label.takeIf { compact }) {
             IconButton(onClick = { renaming = true }) { Icon(Icons.Filled.Edit, contentDescription = "Cambiar nombre") }
             if (!compact) StatusChip(label, tone, Modifier.padding(horizontal = 8.dp))
+            if (demo) TextButton(onClick = { demo = false }) { Text("Salir de la demo") }
             TextButton(onClick = stopAndLeave) { Text("Apagar", color = MaterialTheme.colorScheme.error) }
         }
 
@@ -153,15 +170,19 @@ fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
             val wide = maxWidth > maxHeight && maxWidth >= 600.dp
             // Car screens are usually landscape and short: QR and code side by side so both are always visible
             val wideQrSize = (maxHeight - 150.dp).coerceIn(150.dp, 260.dp)
-            val sideQrSize = (maxHeight - 230.dp).coerceIn(120.dp, 200.dp)
             val actions = DeviceActions(
                 onMove = viewModel::move,
                 onRemove = viewModel::remove,
                 onMute = viewModel::setMuted,
                 onLockVolume = viewModel::setVolumeLocked,
             )
+            val player = PlayerActions(viewModel::setVolume, viewModel::mediaCommand, viewModel::answerVolumeRequest)
+
+            var addingPhone by remember { mutableStateOf(false) }
+            if (addingPhone) AddPhoneDialog(state, viewModel::newCode, onDismiss = { addingPhone = false })
 
             if (state.devices.isEmpty()) {
+                // Waiting for the first phone: only what it takes to connect one
                 Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     if (wide) {
                         JoinCard(state, wideQrSize, Modifier.fillMaxWidth(), horizontal = true)
@@ -174,30 +195,37 @@ fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
                         StepsCard(Modifier.fillMaxWidth())
                         ConnectionMethods(state, connectionActions, Modifier.fillMaxWidth())
                     }
-                    CarAppShortcuts(Modifier.fillMaxWidth())
+                    // The device was taken for the car; a tablet used as a phone can switch here
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                        TextButton(onClick = { demo = true }) {
+                            Text("Ver demo del panel", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        TextButton(onClick = onUseAsPhone) {
+                            Text("Usar como celular", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                 }
             } else if (wide) {
+                // Dashboard like CarPlay: apps in a slim bar, the music big, the phones to the side
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Column(
-                        Modifier.weight(1.5f).verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                    ) {
-                        NowPlayingCard(state, viewModel::setVolume, viewModel::answerVolumeRequest, Modifier.fillMaxWidth())
-                        CarAppShortcuts(Modifier.fillMaxWidth())
+                    CarAppDock(playing = state.track?.playing != false, Modifier.fillMaxHeight())
+                    NowPlayingCard(
+                        state,
+                        player,
+                        large = true,
+                        modifier = Modifier.weight(1.7f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                    )
+                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         DeviceList(state.devices, state.playingId, actions = actions)
-                    }
-                    Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                        AddPhoneCard(state, sideQrSize, viewModel::newCode, Modifier.fillMaxWidth())
-                        ConnectionMethods(state, connectionActions, Modifier.fillMaxWidth())
+                        OutlinedButton(onClick = { addingPhone = true }, modifier = Modifier.fillMaxWidth()) { Text("Agregar celular") }
                     }
                 }
             } else {
                 Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    NowPlayingCard(state, viewModel::setVolume, viewModel::answerVolumeRequest, Modifier.fillMaxWidth())
-                    CarAppShortcuts(Modifier.fillMaxWidth())
+                    NowPlayingCard(state, player, large = false, modifier = Modifier.fillMaxWidth())
+                    CarAppShortcuts(playing = state.track?.playing != false, Modifier.fillMaxWidth())
                     DeviceList(state.devices, state.playingId, actions = actions)
-                    AddPhoneCard(state, 180.dp, viewModel::newCode, Modifier.fillMaxWidth())
-                    ConnectionMethods(state, connectionActions, Modifier.fillMaxWidth())
+                    OutlinedButton(onClick = { addingPhone = true }, modifier = Modifier.fillMaxWidth()) { Text("Agregar celular") }
                 }
             }
         }
@@ -207,23 +235,6 @@ fun CarScreen(onBack: () -> Unit, viewModel: CarViewModel = hiltViewModel()) {
 
 private const val CAR_FONT_SCALE = 1.2f
 private const val COMPACT_WIDTH_DP = 600
-
-/** Asked once: some radios kill background apps, which would cut the music while the map is open. */
-@SuppressLint("BatteryLife") // the car side is a media player that must survive in the background
-private fun askToSkipBatteryOptimization(context: Context) {
-    val prefs = context.getSharedPreferences("car", Context.MODE_PRIVATE)
-    if (prefs.getBoolean(KEY_ASKED_BATTERY, false)) return
-    val power = context.getSystemService(PowerManager::class.java) ?: return
-    if (power.isIgnoringBatteryOptimizations(context.packageName)) return
-    prefs.edit().putBoolean(KEY_ASKED_BATTERY, true).apply()
-    runCatching {
-        context.startActivity(
-            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}")),
-        )
-    }
-}
-
-private const val KEY_ASKED_BATTERY = "asked_battery"
 
 @Composable
 private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
@@ -246,38 +257,79 @@ private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String
 
 private class ConnectionActions(val onNewCode: () -> Unit, val onBluetoothPermission: () -> Unit)
 
+/** Callbacks of the player card. */
+private class PlayerActions(
+    val onVolume: (Int) -> Unit,
+    val onMedia: (MediaAction) -> Unit,
+    val onVolumeRequest: (accept: Boolean) -> Unit,
+)
+
+/** Song on the left, big cover on the right, controls below; the song shows once its phone shares it. */
 @Composable
-private fun NowPlayingCard(
-    state: CarSessionState,
-    onVolume: (Int) -> Unit,
-    onVolumeRequest: (accept: Boolean) -> Unit,
-    modifier: Modifier,
-) {
+private fun NowPlayingCard(state: CarSessionState, actions: PlayerActions, large: Boolean, modifier: Modifier) {
     val playing = state.playing
+    val track = state.track
     SectionCard(modifier) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconBadge(
-                if (playing != null) AppIcons.MusicNote else AppIcons.MusicOff,
-                if (playing != null) AppColors.Success else MaterialTheme.colorScheme.onSurfaceVariant,
-                size = 56.dp,
-            )
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(20.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
-                    if (playing != null) "Sonando" else "Sin música",
+                    if (playing != null) "Sonando · ${playing.name}" else "Sin música",
                     style = MaterialTheme.typography.labelLarge,
                     color = if (playing != null) AppColors.Success else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    playing?.name ?: "Activa el audio en un celular",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                Text(
+                    track?.title ?: if (playing != null) "Música del celular" else "Activa el audio en un celular",
+                    style = if (large) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                track?.artist?.takeIf { it.isNotEmpty() }?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                // Apps like Snapchat or TikTok don't say what plays; nor does a phone without notification access
+                if (playing != null && track == null) {
+                    Text(
+                        "Sin nombre de canción · en el celular toca «Mostrar la canción en el auto»",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
+            Cover(track?.art, active = playing != null, size = if (large) 168.dp else 88.dp)
         }
-        if (playing != null) VolumeSlider(state.volume, onVolume)
+        if (playing != null) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(32.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(onClick = { actions.onMedia(MediaAction.Previous) }, modifier = Modifier.size(56.dp)) {
+                    Icon(AppIcons.SkipPrevious, contentDescription = "Anterior", modifier = Modifier.size(36.dp))
+                }
+                IconButton(onClick = { actions.onMedia(MediaAction.PlayPause) }, modifier = Modifier.size(72.dp)) {
+                    // Without the song info the state is unknown; pause is the likelier wish
+                    Icon(
+                        if (track?.playing == false) AppIcons.Play else AppIcons.Pause,
+                        contentDescription = "Reproducir o pausar",
+                        modifier = Modifier.size(48.dp),
+                    )
+                }
+                IconButton(onClick = { actions.onMedia(MediaAction.Next) }, modifier = Modifier.size(56.dp)) {
+                    Icon(AppIcons.SkipNext, contentDescription = "Siguiente", modifier = Modifier.size(36.dp))
+                }
+            }
+            VolumeSlider(state.volume, actions.onVolume)
+        }
         state.volumeRequest?.let { request ->
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -287,12 +339,42 @@ private fun NowPlayingCard(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-                TextButton(onClick = { onVolumeRequest(false) }) { Text("Ni lo sueñes") }
-                Button(onClick = { onVolumeRequest(true) }) { Text("Subir") }
+                TextButton(onClick = { actions.onVolumeRequest(false) }) { Text("Ni lo sueñes") }
+                Button(onClick = { actions.onVolumeRequest(true) }) { Text("Subir") }
             }
         }
     }
     }
+}
+
+@Composable
+private fun Cover(art: Bitmap?, active: Boolean, size: Dp) {
+    if (art != null) {
+        val image = remember(art) { art.asImageBitmap() }
+        Image(image, contentDescription = null, modifier = Modifier.size(size).clip(RoundedCornerShape(16.dp)))
+    } else {
+        Box(
+            Modifier.size(size).clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                if (active) AppIcons.MusicNote else AppIcons.MusicOff,
+                contentDescription = null,
+                tint = if (active) AppColors.Success else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(size / 2.5f),
+            )
+        }
+    }
+}
+
+/** QR and code for one more phone, only when the driver asks for it. */
+@Composable
+private fun AddPhoneDialog(state: CarSessionState, onNewCode: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        text = { AddPhoneCard(state, 200.dp, onNewCode, Modifier.fillMaxWidth()) },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Listo") } },
+    )
 }
 
 /** Compact join card shown next to the device list, so more phones can join at any time. */

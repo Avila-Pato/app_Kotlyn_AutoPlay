@@ -1,6 +1,7 @@
 package org.example.autoplay
 
 import org.example.autoplay.net.DeviceInfo
+import org.example.autoplay.net.MediaAction
 import org.example.autoplay.net.Message
 import org.example.autoplay.net.Protocol
 import org.example.autoplay.session.JoinLink
@@ -66,6 +67,9 @@ class SessionTest {
             Message.Roster(emptyList(), playingId = null),
             Message.AudioState(true),
             Message.VolumeRequest,
+            Message.MediaCommand(MediaAction.Next),
+            Message.NowPlaying("Mood", "24kGoldn", playing = true, art = "/9j/4AAQ"),
+            Message.NowPlaying("", "", playing = false),
             Message.Notice("El conductor dijo que ni lo sueñes 😎"),
             Message.Audio(byteArrayOf(1, 2, 3, 10, 0)),
             Message.AudioAac(byteArrayOf(0x21, 10, 0)),

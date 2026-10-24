@@ -52,6 +52,16 @@ object AppIcons {
             "M13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z",
     )
 
+    val Navigation = icon("Navigation", "M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z")
+
+    val Play = icon("Play", "M8 5v14l11-7z")
+
+    val Pause = icon("Pause", "M6 19h4V5H6v14zm8-14v14h4V5h-4z")
+
+    val SkipNext = icon("SkipNext", "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z")
+
+    val SkipPrevious = icon("SkipPrevious", "M6 6h2v12H6zm3.5 6l8.5 6V6z")
+
     private fun icon(name: String, pathData: String): ImageVector =
         ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f)
             .addPath(pathData = addPathNodes(pathData), fill = SolidColor(Color.Black))

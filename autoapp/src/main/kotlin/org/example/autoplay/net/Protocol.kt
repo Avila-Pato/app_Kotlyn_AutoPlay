@@ -64,6 +64,12 @@ sealed interface Message {
     /** Car -> phone: a short line from the driver, e.g. the answer to a [VolumeRequest]. */
     data class Notice(val text: String) : Message
 
+    /** Car -> phone playing music: a transport button was pressed on the screen or the steering wheel. */
+    data class MediaCommand(val action: MediaAction) : Message
+
+    /** Phone -> car: the song its music app is playing; [art] is a small JPEG in Base64, empty if none. */
+    data class NowPlaying(val title: String, val artist: String, val playing: Boolean, val art: String = "") : Message
+
     /** Phone -> car: whether this phone is capturing its audio. */
     data class AudioState(val sharing: Boolean) : Message
 
@@ -85,6 +91,8 @@ sealed interface Message {
     /** Either side: the user ended the session. */
     data object Bye : Message
 }
+
+enum class MediaAction { PlayPause, Next, Previous }
 
 /** The single audio format used end to end, so no negotiation or resampling is needed. */
 object AudioSpec {
@@ -126,6 +134,8 @@ object Protocol {
     private const val VOLUME = 12
     private const val VOLUME_REQUEST = 13
     private const val NOTICE = 14
+    private const val MEDIA_COMMAND = 15
+    private const val NOW_PLAYING = 16
 
     fun write(out: DataOutputStream, message: Message) {
         val (type, payload) = when (message) {
@@ -154,6 +164,8 @@ object Protocol {
         is Message.Volume -> VOLUME to listOf(message.level.toString())
         Message.VolumeRequest -> VOLUME_REQUEST to emptyList()
         is Message.Notice -> NOTICE to listOf(message.text)
+        is Message.MediaCommand -> MEDIA_COMMAND to listOf(message.action.name)
+        is Message.NowPlaying -> NOW_PLAYING to listOf(message.title, message.artist, flag(message.playing), message.art)
         is Message.Audio, is Message.AudioAac -> error("Audio is binary")
         Message.Ping -> PING to emptyList()
         Message.Pong -> PONG to emptyList()
@@ -186,6 +198,10 @@ object Protocol {
             VOLUME -> Message.Volume(field(0).toIntOrNull()?.coerceIn(0, 100) ?: throw IOException("Bad volume"))
             VOLUME_REQUEST -> Message.VolumeRequest
             NOTICE -> Message.Notice(field(0))
+            MEDIA_COMMAND -> Message.MediaCommand(
+                MediaAction.entries.find { it.name == field(0) } ?: throw IOException("Unknown media action ${field(0)}"),
+            )
+            NOW_PLAYING -> Message.NowPlaying(field(0), field(1), field(2) == "1", fields.getOrNull(3).orEmpty())
             PING -> Message.Ping
             PONG -> Message.Pong
             BYE -> Message.Bye

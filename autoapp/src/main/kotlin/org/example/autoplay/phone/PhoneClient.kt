@@ -70,6 +70,7 @@ data class CarRoom(
 class PhoneClient @Inject constructor(
     @ApplicationContext private val context: Context,
     private val knownCars: KnownCars,
+    private val media: PhoneMedia,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _status = MutableStateFlow<PhoneStatus>(PhoneStatus.Disconnected)
@@ -115,6 +116,12 @@ class PhoneClient @Inject constructor(
         }
         _room.value = null
         _status.value = PhoneStatus.Disconnected
+        media.stop()
+    }
+
+    /** The user just granted notification access: start sending the song to the car. */
+    fun onMediaAccessChanged() {
+        if (connection != null) media.start()
     }
 
     /** Called by [PhoneService] when audio capture starts or stops. */
@@ -227,12 +234,22 @@ class PhoneClient @Inject constructor(
                 conn.close()
             }
         }
+        // The song on this phone, for the car screen; also re-sent after a reconnect
+        media.start()
+        val songs = launch {
+            try {
+                media.nowPlaying.collect { song -> conn.send(song ?: Message.NowPlaying("", "", playing = false)) }
+            } catch (e: IOException) {
+                conn.close()
+            }
+        }
         try {
             while (true) {
                 val message = conn.receive()
                 if (message == Message.Bye) break
                 // Pongs only keep the read timeout from firing
                 if (message is Message.Notice) _notice.value = message.text
+                if (message is Message.MediaCommand) media.command(message.action)
                 if (message is Message.Roster) {
                     _room.value = _room.value?.copy(devices = message.devices, playingId = message.playingId, volume = message.volume)
                     // The driver may rename the car while we are connected
@@ -247,6 +264,7 @@ class PhoneClient @Inject constructor(
             false
         } finally {
             pinger.cancel()
+            songs.cancel()
             conn.close()
         }
     }

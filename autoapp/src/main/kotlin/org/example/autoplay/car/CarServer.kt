@@ -6,7 +6,10 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
+import android.util.Base64
 import androidx.core.content.ContextCompat
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
@@ -28,6 +31,7 @@ import org.example.autoplay.net.AacDecoder
 import org.example.autoplay.net.CarDiscovery
 import org.example.autoplay.net.Connection
 import org.example.autoplay.net.DeviceInfo
+import org.example.autoplay.net.MediaAction
 import org.example.autoplay.net.Message
 import org.example.autoplay.net.Protocol
 import org.example.autoplay.net.localIpv4Address
@@ -42,6 +46,9 @@ import javax.inject.Singleton
 
 /** A phone sent the right code; the driver must press "Permitir". */
 data class JoinRequest(val deviceName: String, val address: String?)
+
+/** The song on the phone that has the music; empty fields when its app shares nothing. */
+data class Track(val title: String, val artist: String, val playing: Boolean, val art: Bitmap?)
 
 /** A phone with a locked volume asked for more; the driver decides. */
 data class VolumeRequest(val deviceId: String, val deviceName: String)
@@ -71,6 +78,7 @@ data class CarSessionState(
     /** Music volume, 0..100; changed by the phone that plays or on the car screen. */
     val volume: Int = CarServer.DEFAULT_VOLUME,
     val volumeRequest: VolumeRequest? = null,
+    val track: Track? = null,
 ) {
     val joinLink: JoinLink? get() = host?.takeIf { code.isNotEmpty() }?.let { JoinLink(it, port, code) }
     val playing: DeviceInfo? get() = devices.find { it.id == playingId }
@@ -95,6 +103,8 @@ class CarServer @Inject constructor(
         var muted = false
         var volumeLocked = false
         var lastVolumeRequest = 0L
+        var track: Track? = null
+        var artKey = ""
         var resumeTimeout: Job? = null
     }
 
@@ -256,6 +266,26 @@ class CarServer @Inject constructor(
         scope?.launch { runCatching { connection.send(Message.Notice(reply)) } }
     }
 
+    /** ⏮ ⏯ ⏭ from the screen or the steering wheel go to the phone that has the music. */
+    fun mediaCommand(action: MediaAction) {
+        val connection = synchronized(lock) { currentPlayerLocked()?.connection } ?: return
+        scope?.launch { runCatching { connection.send(Message.MediaCommand(action)) } }
+    }
+
+    private fun onNowPlaying(session: Session, song: Message.NowPlaying) {
+        // The cover only changes with the song, so pause and play reuse the decoded one
+        val art = if (song.art == session.artKey) {
+            session.track?.art
+        } else {
+            runCatching { Base64.decode(song.art, Base64.DEFAULT).let { BitmapFactory.decodeByteArray(it, 0, it.size) } }.getOrNull()
+        }
+        synchronized(lock) {
+            session.artKey = song.art
+            session.track = Track(song.title, song.artist, song.playing, art).takeIf { song.title.isNotEmpty() }
+        }
+        rosterChanged.trySend(Unit)
+    }
+
     private fun onVolumeRequest(session: Session) {
         val now = System.currentTimeMillis()
         synchronized(lock) {
@@ -341,8 +371,10 @@ class CarServer @Inject constructor(
     private suspend fun broadcastRoster() {
         var lastPlaying: String? = null
         for (signal in rosterChanged) {
+            var track: Track? = null
             val (devices, playingId, connections) = synchronized(lock) {
                 val playing = currentPlayerLocked()
+                track = playing?.track
                 Triple(
                     sessions.map {
                         DeviceInfo(it.id, it.name, it.connection != null, it.sharing, it.bluetooth, it.muted, it.volumeLocked)
@@ -351,7 +383,7 @@ class CarServer @Inject constructor(
                     sessions.mapNotNull { it.connection },
                 )
             }
-            _state.update { it.copy(devices = devices, playingId = playingId) }
+            _state.update { it.copy(devices = devices, playingId = playingId, track = track) }
             val volume = _state.value.volume
             if (playingId == null && lastPlaying != null) player.stop()
             lastPlaying = playingId
@@ -479,6 +511,7 @@ class CarServer @Inject constructor(
                     Message.Ping -> connection.send(Message.Pong)
                     is Message.Volume -> if (isPlaying(session) && !synchronized(lock) { session.volumeLocked }) setVolume(message.level)
                     Message.VolumeRequest -> onVolumeRequest(session)
+                    is Message.NowPlaying -> onNowPlaying(session, message)
                     is Message.AudioState -> {
                         synchronized(lock) { session.sharing = message.sharing }
                         rosterChanged.trySend(Unit)

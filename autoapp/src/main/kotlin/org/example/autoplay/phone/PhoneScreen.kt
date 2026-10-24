@@ -75,7 +75,7 @@ import org.example.autoplay.ui.Tone
 import org.example.autoplay.ui.VolumeSlider
 
 @Composable
-fun PhoneScreen(onBack: () -> Unit, viewModel: PhoneViewModel = hiltViewModel()) {
+fun PhoneScreen(onBack: () -> Unit, onUseAsCar: () -> Unit, viewModel: PhoneViewModel = hiltViewModel()) {
     val status by viewModel.status.collectAsStateWithLifecycle()
     var scanning by rememberSaveable { mutableStateOf(false) }
 
@@ -102,6 +102,16 @@ fun PhoneScreen(onBack: () -> Unit, viewModel: PhoneViewModel = hiltViewModel())
     }
     val volume = CarVolume(viewModel::setCarVolume, viewModel::askForMoreVolume, notice)
 
+    // Asked for only once the user is in the car; null once granted
+    val context = LocalContext.current
+    var mediaAccess by remember { mutableStateOf(viewModel.hasMediaAccess()) }
+    LifecycleResumeEffect(Unit) {
+        mediaAccess = viewModel.hasMediaAccess()
+        if (mediaAccess) viewModel.onMediaAccessChanged()
+        onPauseOrDispose {}
+    }
+    val enableSong = { context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }.takeIf { !mediaAccess }
+
     // Right after joining, ask once for audio so the user does not have to find the button
     val connected = status is PhoneStatus.Connected
     var askedForAudio by rememberSaveable { mutableStateOf(false) }
@@ -114,16 +124,16 @@ fun PhoneScreen(onBack: () -> Unit, viewModel: PhoneViewModel = hiltViewModel())
 
     when (val s = status) {
         is PhoneStatus.Connected ->
-            SessionView(s.carName, reconnectAttempt = null, room, sharing, requestAudio, volume, viewModel::disconnect)
+            SessionView(s.carName, reconnectAttempt = null, room, sharing, requestAudio, volume, enableSong, viewModel::disconnect)
         is PhoneStatus.Reconnecting ->
-            SessionView(s.carName, reconnectAttempt = s.attempt, room, sharing, requestAudio, volume, viewModel::disconnect)
-        else -> JoinView(status, viewModel, onBack, onScan = { scanning = true })
+            SessionView(s.carName, reconnectAttempt = s.attempt, room, sharing, requestAudio, volume, enableSong, viewModel::disconnect)
+        else -> JoinView(status, viewModel, onBack, onUseAsCar, onScan = { scanning = true })
     }
 }
 
 @Composable
-private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () -> Unit, onScan: () -> Unit) {
-    val code by viewModel.code.collectAsStateWithLifecycle()
+private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () -> Unit, onUseAsCar: () -> Unit, onScan: () -> Unit) {
+    val code = viewModel.code
     val cars by viewModel.cars.collectAsStateWithLifecycle()
     val busy = status == PhoneStatus.Connecting || status == PhoneStatus.WaitingApproval
     val canJoin = code.length == 6 && !busy
@@ -131,7 +141,7 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
     val myCars by viewModel.myCars.collectAsStateWithLifecycle()
 
     Column(Modifier.fillMaxSize()) {
-        ScreenHeader(title = "Unirse al auto", subtitle = "Conecta este celular para poner tu música", onBack = onBack)
+        ScreenHeader(title = "Unirse al auto", subtitle = "Conecta este celular para poner tu música")
         Column(
             Modifier
                 .fillMaxSize()
@@ -152,6 +162,10 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
                     ManualConnection(viewModel, enabled = canJoin)
                 }
                 JoinMethod.Bluetooth -> BluetoothDevices(viewModel, enabled = !busy)
+            }
+            // The device was taken for a phone; a tablet in the car can switch here
+            TextButton(onClick = onUseAsCar, modifier = Modifier.fillMaxWidth()) {
+                Text("Usar este equipo como auto", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -420,7 +434,7 @@ private fun PairedDeviceCard(device: PairedDevice, enabled: Boolean, onClick: ()
 
 @Composable
 private fun ManualConnection(viewModel: PhoneViewModel, enabled: Boolean) {
-    val address by viewModel.manualAddress.collectAsStateWithLifecycle()
+    val address = viewModel.manualAddress
     var expanded by rememberSaveable { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -452,6 +466,7 @@ private fun SessionView(
     sharing: Boolean,
     onShareAudio: () -> Unit,
     volume: CarVolume,
+    onEnableSong: (() -> Unit)?,
     onDisconnect: () -> Unit,
 ) {
     val reconnecting = reconnectAttempt != null
@@ -486,6 +501,9 @@ private fun SessionView(
             verticalArrangement = Arrangement.spacedBy(28.dp),
         ) {
             NowPlaying(reconnecting, room, sharing, onShareAudio, volume)
+            onEnableSong?.let {
+                TextButton(onClick = it, modifier = Modifier.fillMaxWidth()) { Text("Mostrar la canción en el auto") }
+            }
             DeviceList(room?.devices.orEmpty(), room?.playingId, selfId = room?.selfId)
             Text(
                 "Puedes salir de la app: la conexión sigue activa.",

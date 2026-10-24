@@ -193,7 +193,8 @@ fun CodeInput(value: String, onValueChange: (String) -> Unit, enabled: Boolean, 
     BasicTextField(
         value = value,
         onValueChange = onValueChange,
-        enabled = enabled,
+        // Disabling a focused field closes the keyboard; read-only keeps it while a connection attempt runs
+        readOnly = !enabled,
         singleLine = true,
         interactionSource = interaction,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),

@@ -11,6 +11,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.ContextCompat
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -44,6 +47,7 @@ data class PairedDevice(
 class PhoneViewModel @Inject constructor(
     private val client: PhoneClient,
     private val knownCars: KnownCars,
+    private val media: PhoneMedia,
     discovery: CarDiscovery,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
@@ -56,11 +60,12 @@ class PhoneViewModel @Inject constructor(
     val cars: StateFlow<List<DiscoveredCar>> =
         discovery.discover().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    private val _code = MutableStateFlow("")
-    val code: StateFlow<String> = _code.asStateFlow()
+    // Compose state, not StateFlow: a text field fed asynchronously makes the keyboard restart while typing
+    var code by mutableStateOf("")
+        private set
 
-    private val _manualAddress = MutableStateFlow("")
-    val manualAddress: StateFlow<String> = _manualAddress.asStateFlow()
+    var manualAddress by mutableStateOf("")
+        private set
 
     /** Null until the Bluetooth permission is granted. */
     private val _pairedDevices = MutableStateFlow<List<PairedDevice>?>(null)
@@ -80,14 +85,14 @@ class PhoneViewModel @Inject constructor(
     fun forgetCar(car: KnownCar) = knownCars.forget(car.id)
 
     fun onCodeChange(value: String) {
-        _code.value = value.filter(Char::isDigit).take(6)
+        code = value.filter(Char::isDigit).take(6)
     }
 
     fun onManualAddressChange(value: String) {
-        _manualAddress.value = value.trim()
+        manualAddress = value.trim()
     }
 
-    fun connectTo(car: DiscoveredCar) = connect(CarTarget.Wifi(car.host, car.port), _code.value)
+    fun connectTo(car: DiscoveredCar) = connect(CarTarget.Wifi(car.host, car.port), code)
 
     /** No code over Bluetooth: pairing proves the phone is in the car, and the car still asks the driver. */
     fun connectBluetooth(device: PairedDevice) = connect(CarTarget.Bluetooth(device.address, device.name), code = "")
@@ -139,14 +144,14 @@ class PhoneViewModel @Inject constructor(
 
     /** Accepts `192.168.43.1` or `192.168.43.1:47800`. */
     fun connectManually() {
-        val host = _manualAddress.value.substringBefore(':')
-        val port = _manualAddress.value.substringAfter(':', "").toIntOrNull() ?: Protocol.DEFAULT_PORT
-        if (host.isNotEmpty()) connect(CarTarget.Wifi(host, port), _code.value)
+        val host = manualAddress.substringBefore(':')
+        val port = manualAddress.substringAfter(':', "").toIntOrNull() ?: Protocol.DEFAULT_PORT
+        if (host.isNotEmpty()) connect(CarTarget.Wifi(host, port), code)
     }
 
     /** Used by the QR scanner; the link already carries host, port and code. */
     fun connectWithLink(link: JoinLink) {
-        _code.value = link.code
+        code = link.code
         connect(CarTarget.Wifi(link.host, link.port), link.code)
     }
 
@@ -156,6 +161,11 @@ class PhoneViewModel @Inject constructor(
     fun setCarVolume(level: Int) = client.setCarVolume(level)
     fun askForMoreVolume() = client.askForMoreVolume()
     fun clearNotice() = client.clearNotice()
+
+    fun hasMediaAccess() = media.hasAccess()
+
+    /** Back from the settings: if access was granted, the song starts showing in the car. */
+    fun onMediaAccessChanged() = client.onMediaAccessChanged()
 
     fun disconnect() = client.disconnect()
 

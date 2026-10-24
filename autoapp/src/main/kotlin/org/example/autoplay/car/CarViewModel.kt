@@ -10,6 +10,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import org.example.autoplay.net.MediaAction
 import javax.inject.Inject
 
 @HiltViewModel
@@ -44,6 +45,7 @@ class CarViewModel @Inject constructor(
     fun setMuted(deviceId: String, muted: Boolean) = server.setMuted(deviceId, muted)
     fun setVolumeLocked(deviceId: String, locked: Boolean) = server.setVolumeLocked(deviceId, locked)
     fun answerVolumeRequest(accept: Boolean) = server.answerVolumeRequest(accept)
+    fun mediaCommand(action: MediaAction) = server.mediaCommand(action)
     /** Removing a phone from the car screen also forgets it, so it needs a code to come back. */
     fun remove(deviceId: String) = server.remove(deviceId, forget = true)
 
