@@ -60,7 +60,9 @@ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
+import org.example.autoplay.mycar.MyCarEntryCard
 import org.example.autoplay.net.DiscoveredCar
+import org.example.autoplay.net.MAX_SAY_LENGTH
 import org.example.autoplay.ui.AppColors
 import org.example.autoplay.ui.AppIcons
 import org.example.autoplay.ui.CodeInput
@@ -75,7 +77,7 @@ import org.example.autoplay.ui.Tone
 import org.example.autoplay.ui.VolumeSlider
 
 @Composable
-fun PhoneScreen(onBack: () -> Unit, onUseAsCar: () -> Unit, viewModel: PhoneViewModel = hiltViewModel()) {
+fun PhoneScreen(onBack: () -> Unit, onUseAsCar: () -> Unit, onMyCar: () -> Unit, viewModel: PhoneViewModel = hiltViewModel()) {
     val status by viewModel.status.collectAsStateWithLifecycle()
     var scanning by rememberSaveable { mutableStateOf(false) }
 
@@ -124,15 +126,22 @@ fun PhoneScreen(onBack: () -> Unit, onUseAsCar: () -> Unit, viewModel: PhoneView
 
     when (val s = status) {
         is PhoneStatus.Connected ->
-            SessionView(s.carName, reconnectAttempt = null, room, sharing, requestAudio, volume, enableSong, viewModel::disconnect)
+            SessionView(s.carName, reconnectAttempt = null, room, sharing, requestAudio, volume, enableSong, onMyCar, viewModel::say, viewModel::disconnect)
         is PhoneStatus.Reconnecting ->
-            SessionView(s.carName, reconnectAttempt = s.attempt, room, sharing, requestAudio, volume, enableSong, viewModel::disconnect)
-        else -> JoinView(status, viewModel, onBack, onUseAsCar, onScan = { scanning = true })
+            SessionView(s.carName, reconnectAttempt = s.attempt, room, sharing, requestAudio, volume, enableSong, onMyCar, viewModel::say, viewModel::disconnect)
+        else -> JoinView(status, viewModel, onBack, onUseAsCar, onMyCar, onScan = { scanning = true })
     }
 }
 
 @Composable
-private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () -> Unit, onUseAsCar: () -> Unit, onScan: () -> Unit) {
+private fun JoinView(
+    status: PhoneStatus,
+    viewModel: PhoneViewModel,
+    onBack: () -> Unit,
+    onUseAsCar: () -> Unit,
+    onMyCar: () -> Unit,
+    onScan: () -> Unit,
+) {
     val code = viewModel.code
     val cars by viewModel.cars.collectAsStateWithLifecycle()
     val busy = status == PhoneStatus.Connecting || status == PhoneStatus.WaitingApproval
@@ -163,6 +172,7 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
                 }
                 JoinMethod.Bluetooth -> BluetoothDevices(viewModel, enabled = !busy)
             }
+            MyCarEntryCard(onClick = onMyCar)
             // The device was taken for a phone; a tablet in the car can switch here
             TextButton(onClick = onUseAsCar, modifier = Modifier.fillMaxWidth()) {
                 Text("Usar este equipo como auto", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -467,6 +477,8 @@ private fun SessionView(
     onShareAudio: () -> Unit,
     volume: CarVolume,
     onEnableSong: (() -> Unit)?,
+    onMyCar: () -> Unit,
+    onSay: (String) -> Boolean,
     onDisconnect: () -> Unit,
 ) {
     val reconnecting = reconnectAttempt != null
@@ -501,10 +513,12 @@ private fun SessionView(
             verticalArrangement = Arrangement.spacedBy(28.dp),
         ) {
             NowPlaying(reconnecting, room, sharing, onShareAudio, volume)
+            MessageComposer(enabled = !reconnecting, onSend = onSay)
             onEnableSong?.let {
                 TextButton(onClick = it, modifier = Modifier.fillMaxWidth()) { Text("Mostrar la canción en el auto") }
             }
             DeviceList(room?.devices.orEmpty(), room?.playingId, selfId = room?.selfId)
+            MyCarEntryCard(onClick = onMyCar, compact = true)
             Text(
                 "Puedes salir de la app: la conexión sigue activa.",
                 style = MaterialTheme.typography.bodySmall,
@@ -515,6 +529,50 @@ private fun SessionView(
         }
     }
 }
+
+/** A line for the radio: it shows it and reads it aloud, so the driver does not have to look at anything. */
+@Composable
+private fun MessageComposer(enabled: Boolean, onSend: (String) -> Boolean) {
+    var text by rememberSaveable { mutableStateOf("") }
+    var justSent by remember { mutableStateOf(false) }
+    // The car takes one message every few seconds; the button rests until then
+    LaunchedEffect(justSent) {
+        if (justSent) {
+            delay(SEND_COOLDOWN_MILLIS)
+            justSent = false
+        }
+    }
+    SectionCard(Modifier.fillMaxWidth()) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Mensaje al auto", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "La radio lo muestra y lo lee en voz alta.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it.take(MAX_SAY_LENGTH) },
+                placeholder = { Text("Ej: llegamos en 5 minutos") },
+                supportingText = { Text("${text.length} de $MAX_SAY_LENGTH") },
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = {
+                    if (onSend(text)) {
+                        text = ""
+                        justSent = true
+                    }
+                },
+                enabled = enabled && text.isNotBlank() && !justSent,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(if (justSent) "Enviado" else "Enviar") }
+        }
+    }
+}
+
+private const val SEND_COOLDOWN_MILLIS = 5_000L
 
 /** What a passenger can do with the car's volume; [notice] is the driver's latest reply. */
 private class CarVolume(val onChange: (Int) -> Unit, val onAskForMore: () -> Unit, val notice: String?)

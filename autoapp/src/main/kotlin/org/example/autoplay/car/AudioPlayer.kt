@@ -21,19 +21,32 @@ class AudioPlayer @Inject constructor(@ApplicationContext context: Context) {
         .build()
     private val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
         .setAudioAttributes(attributes)
-        .setOnAudioFocusChangeListener {}
+        .setOnAudioFocusChangeListener { change -> onFocusChange?.invoke(change) }
         .build()
+
+    /** Called when another app takes or gives back the audio, so the car can pause the phone's music. */
+    @Volatile var onFocusChange: ((Int) -> Unit)? = null
 
     private var track: AudioTrack? = null
     private var sourceId: String? = null
     private var gain = 1f
+    private var ducked = false
 
     /** Music volume chosen from the phone or the car screen, on top of the radio's own volume knob. */
     @Synchronized
     fun setGain(value: Float) {
         gain = value.coerceIn(0f, 1f)
-        track?.setVolume(gain)
+        track?.setVolume(effectiveGain())
     }
+
+    /** Lowers the music while an alert is spoken over it. */
+    @Synchronized
+    fun duck(on: Boolean) {
+        ducked = on
+        track?.setVolume(effectiveGain())
+    }
+
+    private fun effectiveGain() = if (ducked) gain * DUCKED_FACTOR else gain
 
     /** Blocks while the track buffer is full, which paces the sender through TCP back-pressure. */
     @Synchronized
@@ -44,12 +57,21 @@ class AudioPlayer @Inject constructor(@ApplicationContext context: Context) {
             sourceId = fromId
         }
         val current = track ?: createTrack().also {
-            it.setVolume(gain)
+            it.setVolume(effectiveGain())
             track = it
             audioManager.requestAudioFocus(focusRequest)
         }
         if (current.playState != AudioTrack.PLAYSTATE_PLAYING) current.play()
         current.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+    }
+
+    /** Holds the music without letting go of the audio, so it is heard again when the other app gives it back. */
+    @Synchronized
+    fun pause() {
+        track?.run {
+            pause()
+            flush()
+        }
     }
 
     /** Silences the car when no phone is playing anymore. */
@@ -84,5 +106,9 @@ class AudioPlayer @Inject constructor(@ApplicationContext context: Context) {
             .setBufferSizeInBytes(buffer)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
+    }
+
+    private companion object {
+        const val DUCKED_FACTOR = 0.3f
     }
 }

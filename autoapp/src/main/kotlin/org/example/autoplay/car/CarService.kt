@@ -27,6 +27,7 @@ import javax.inject.Inject
 @AndroidEntryPoint
 class CarService : Service() {
     @Inject lateinit var server: CarServer
+    @Inject lateinit var announcer: Announcer
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -60,6 +61,18 @@ class CarService : Service() {
                 updateMediaSession(track, phone, active)
             }
         }
+        // Out loud, so the driver hears it even with a map open on top
+        scope.launch {
+            server.state.map { it.volumeRequest }.distinctUntilChanged().collect { request ->
+                if (request != null) announcer.speak(volumeRequestMessage(request.deviceName))
+            }
+        }
+        // A line typed on a phone is read aloud too, so the driver does not have to look
+        scope.launch {
+            server.state.map { it.message }.distinctUntilChanged().collect { message ->
+                if (message != null) announcer.speak(spokenMessage(message.deviceName, message.text))
+            }
+        }
         scope.launch {
             server.state.map { it.running to "${it.carName}\n${notificationText(it)}" }.distinctUntilChanged().collect { (running, text) ->
                 if (running) SessionNotification.update(this@CarService, notification(text.substringAfter('\n'))) else stopSelf()
@@ -79,6 +92,7 @@ class CarService : Service() {
     }
 
     override fun onDestroy() {
+        announcer.release()
         mediaSession.release()
         scope.cancel()
         super.onDestroy()

@@ -12,20 +12,31 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -43,60 +54,49 @@ import androidx.core.graphics.drawable.toBitmap
 import org.example.autoplay.ui.AppIcons
 import org.example.autoplay.ui.SectionCard
 
-/** Apps the driver often needs next to the music; each must also be listed under <queries> in the manifest. */
-private val SHORTCUTS = listOf(
-    Shortcut("com.waze", "Waze", navigation = true),
-    Shortcut("com.google.android.apps.maps", "Maps", navigation = true),
-    Shortcut("com.spotify.music", "Spotify"),
-    Shortcut("com.google.android.apps.youtube.music", "YT Music"),
-)
-
-private class Shortcut(val pkg: String, val label: String, val navigation: Boolean = false)
-
 private class InstalledApp(val label: String, val icon: ImageBitmap, val launch: Intent, val navigation: Boolean)
 
 /**
  * One tap opens maps or another app; AutoPlay keeps playing in the background through [CarService].
- * Only apps installed on this head unit show up, and nothing at all if none is.
+ * The driver picks the apps with the edit button, so it shows up even when none is installed.
  */
 @Composable
-fun CarAppShortcuts(playing: Boolean, modifier: Modifier = Modifier) {
-    val apps = rememberInstalledApps()
-    if (apps.isEmpty()) return
-
+fun CarAppShortcuts(playing: Boolean, packages: List<String>, onEdit: () -> Unit, modifier: Modifier = Modifier) {
+    val apps = rememberInstalledApps(packages)
     val open = rememberAppOpener()
     SectionCard(modifier) {
-        Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
             NavigationButton(apps, playing, showLabel = true)
             apps.forEach { AppButton(it, showLabel = true, open) }
+            EditAppsButton(showLabel = true, onEdit)
         }
     }
 }
 
 /** The same shortcuts as a side bar, for the dashboard on wide head units. */
 @Composable
-fun CarAppDock(playing: Boolean, modifier: Modifier = Modifier) {
-    val apps = rememberInstalledApps()
-    if (apps.isEmpty()) return
-
+fun CarAppDock(playing: Boolean, packages: List<String>, onEdit: () -> Unit, modifier: Modifier = Modifier) {
+    val apps = rememberInstalledApps(packages)
+    val open = rememberAppOpener()
     Column(
         modifier
             .clip(RoundedCornerShape(20.dp))
             .background(MaterialTheme.colorScheme.surfaceContainer)
+            .verticalScroll(rememberScrollState())
             .padding(vertical = 16.dp, horizontal = 8.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        val open = rememberAppOpener()
         NavigationButton(apps, playing, showLabel = false)
         apps.forEach { AppButton(it, showLabel = false, open) }
+        EditAppsButton(showLabel = false, onEdit)
     }
 }
 
 @Composable
-private fun rememberInstalledApps(): List<InstalledApp> {
+private fun rememberInstalledApps(packages: List<String>): List<InstalledApp> {
     val context = LocalContext.current
-    return remember { installedApps(context) }
+    return remember(packages) { installedApps(context, packages) }
 }
 
 /**
@@ -155,6 +155,29 @@ private fun AppButton(app: InstalledApp, showLabel: Boolean, open: (InstalledApp
     }
 }
 
+/** Opens the picker where the driver adds or removes apps from the panel. */
+@Composable
+private fun EditAppsButton(showLabel: Boolean, onClick: () -> Unit) {
+    Column(
+        Modifier
+            .width(if (showLabel) 72.dp else 56.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(
+            Modifier.size(48.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceContainerHighest),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Filled.Edit, contentDescription = "Editar apps", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (showLabel) {
+            Text("Editar", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+        }
+    }
+}
+
 /**
  * "Navegar": the map full screen with AutoPlay as a floating mini player in a corner.
  * With both Waze and Maps installed the driver picks one.
@@ -199,14 +222,71 @@ private fun NavigationButton(apps: List<InstalledApp>, playing: Boolean, showLab
     }
 }
 
-private fun installedApps(context: Context): List<InstalledApp> {
+private fun installedApps(context: Context, packages: List<String>): List<InstalledApp> {
     val pm = context.packageManager
-    return SHORTCUTS.mapNotNull { shortcut ->
-        val launch = pm.getLaunchIntentForPackage(shortcut.pkg) ?: return@mapNotNull null
-        val icon = runCatching { pm.getApplicationIcon(shortcut.pkg).toBitmap(96, 96).asImageBitmap() }.getOrNull()
+    return packages.mapNotNull { pkg ->
+        val launch = pm.getLaunchIntentForPackage(pkg) ?: return@mapNotNull null
+        // The launcher activity's own icon and label, the same the picker shows
+        val label = runCatching { launch.resolveActivityInfo(pm, 0)?.loadLabel(pm)?.toString() }.getOrNull()
+            ?: return@mapNotNull null
+        val icon = runCatching { pm.getActivityIcon(launch).toBitmap(96, 96).asImageBitmap() }.getOrNull()
             ?: return@mapNotNull null
         // Radios with split screen open the app beside AutoPlay; the rest simply ignore the flag
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
-        InstalledApp(shortcut.label, icon, launch, shortcut.navigation)
+        InstalledApp(shortLabel(label), icon, launch, pkg in NAVIGATION_APPS)
     }
+}
+
+/** Labels sit under a 72 dp icon: "YouTube Music" becomes "YT Music" like the old fixed list. */
+private fun shortLabel(label: String): String = label.replace("YouTube Music", "YT Music")
+
+private class PickableApp(val pkg: String, val label: String, val icon: ImageBitmap)
+
+/** Lets the driver add any app of this radio to the panel, or take one out. */
+@Composable
+fun AppPickerDialog(selected: List<String>, onDismiss: () -> Unit, onSave: (List<String>) -> Unit) {
+    val context = LocalContext.current
+    val apps = remember { launchableApps(context, pinned = selected + DEFAULT_CAR_APPS) }
+    var chosen by remember { mutableStateOf(selected) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Apps del panel") },
+        text = {
+            Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                apps.forEach { app ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { chosen = togglePackage(chosen, app.pkg) }
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = app.pkg in chosen, onCheckedChange = { chosen = togglePackage(chosen, app.pkg) })
+                        Image(app.icon, contentDescription = null, modifier = Modifier.size(36.dp))
+                        Text(app.label, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { onSave(chosen) }) { Text("Listo") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } },
+    )
+}
+
+/** Every app with a launcher icon except AutoPlay; the chosen and suggested ones come first. */
+@SuppressLint("QueryPermissionsNeeded") // the manifest's <queries> names the launcher intent
+private fun launchableApps(context: Context, pinned: List<String>): List<PickableApp> {
+    val pm = context.packageManager
+    val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    return pm.queryIntentActivities(launcher, 0)
+        .mapNotNull { info ->
+            val pkg = info.activityInfo.packageName
+            if (pkg == context.packageName) return@mapNotNull null
+            val icon = runCatching { info.loadIcon(pm).toBitmap(96, 96).asImageBitmap() }.getOrNull() ?: return@mapNotNull null
+            PickableApp(pkg, info.loadLabel(pm).toString(), icon)
+        }
+        .distinctBy { it.pkg }
+        .sortedWith(compareBy<PickableApp>({ it.pkg !in pinned }, { it.label.lowercase() }))
 }

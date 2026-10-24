@@ -26,6 +26,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -90,10 +92,12 @@ object NavigationMode {
 
 /** What fits in the floating window: cover and song; Android draws the buttons on top when touched. */
 @Composable
-fun MiniPlayer(state: CarSessionState) {
+fun MiniPlayer(state: CarSessionState, effects: Boolean = true) {
     val track = state.track
+    val base = MaterialTheme.colorScheme.background
+    val tint = rememberCoverTint(track?.art, effects, base)
     Row(
-        Modifier.fillMaxSize().padding(10.dp),
+        Modifier.fillMaxSize().drawBehind { drawRect(Brush.verticalGradient(listOf(tint.value, base))) }.padding(10.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

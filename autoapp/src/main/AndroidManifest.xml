@@ -31,8 +31,16 @@
     <!-- Head units often kill background apps to "save battery"; the car side asks to be left alone -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Shortcuts on the car screen; Android 11+ hides other apps unless they are named here -->
+    <!-- Android 11+ hides other apps unless they are named here: the panel's apps, any launcher app
+         for the picker, and the speech engine for spoken alerts -->
     <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
         <package android:name="com.waze" />
         <package android:name="com.google.android.apps.maps" />
         <package android:name="com.spotify.music" />
@@ -46,6 +54,17 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.AutoPlay"
         android:supportsRtl="true">
+
+        <!-- Lets the camera app write a photo of a paper into AutoPlay's cache -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <activity
             android:name=".MainActivity"

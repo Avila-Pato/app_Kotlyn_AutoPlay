@@ -11,16 +11,20 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -38,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.example.autoplay.net.DeviceInfo
+import org.example.autoplay.net.MAX_DEVICE_NAME
 
 /** Actions only the car screen has: the driver decides the priority. */
 class DeviceActions(
@@ -45,6 +50,7 @@ class DeviceActions(
     val onRemove: (deviceId: String) -> Unit,
     val onMute: (deviceId: String, muted: Boolean) -> Unit,
     val onLockVolume: (deviceId: String, locked: Boolean) -> Unit,
+    val onRename: (deviceId: String, name: String) -> Unit,
 )
 
 /**
@@ -166,7 +172,34 @@ private fun DeviceRow(
 @Composable
 private fun DeviceMenu(device: DeviceInfo, actions: DeviceActions, moveUp: Int?, moveDown: Int?) {
     var open by remember { mutableStateOf(false) }
+    var confirmRemove by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
     val close = { open = false }
+    if (renaming) {
+        RenameDeviceDialog(
+            current = device.name,
+            onDismiss = { renaming = false },
+            onSave = {
+                actions.onRename(device.id, it)
+                renaming = false
+            },
+        )
+    }
+    // Disconnecting also forgets the phone, so it asks first: a stray tap on a head unit is easy
+    if (confirmRemove) {
+        AlertDialog(
+            onDismissRequest = { confirmRemove = false },
+            title = { Text("¿Desconectar a ${device.name}?") },
+            text = { Text("Para volver tendrá que usar un código.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRemove = false
+                    actions.onRemove(device.id)
+                }) { Text("Desconectar", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancelar") } },
+        )
+    }
     Box {
         IconButton(onClick = { open = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Más opciones") }
         DropdownMenu(expanded = open, onDismissRequest = close) {
@@ -178,11 +211,32 @@ private fun DeviceMenu(device: DeviceInfo, actions: DeviceActions, moveUp: Int?,
             MenuItem(if (device.volumeLocked) "Devolver el volumen" else "Bloquear volumen", Icons.Filled.Lock, close) {
                 actions.onLockVolume(device.id, !device.volumeLocked)
             }
+            MenuItem("Cambiar nombre", Icons.Filled.Edit, close) { renaming = true }
             moveUp?.let { MenuItem("Subir prioridad", Icons.Filled.KeyboardArrowUp, close) { actions.onMove(device.id, it) } }
             moveDown?.let { MenuItem("Bajar prioridad", Icons.Filled.KeyboardArrowDown, close) { actions.onMove(device.id, it) } }
-            MenuItem("Desconectar", Icons.Filled.Close, close, MaterialTheme.colorScheme.error) { actions.onRemove(device.id) }
+            MenuItem("Desconectar", Icons.Filled.Close, close, MaterialTheme.colorScheme.error) { confirmRemove = true }
         }
     }
+}
+
+/** The driver's own name for a phone: "Galaxy de Ana" instead of "SM-S918B". */
+@Composable
+private fun RenameDeviceDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Nombre del celular") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it.take(MAX_DEVICE_NAME) },
+                singleLine = true,
+                placeholder = { Text("Ej: Celular de Ana") },
+            )
+        },
+        confirmButton = { Button(onClick = { onSave(name) }, enabled = name.isNotBlank()) { Text("Guardar") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } },
+    )
 }
 
 @Composable

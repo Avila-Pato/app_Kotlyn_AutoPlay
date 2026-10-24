@@ -5,6 +5,19 @@ import java.io.DataOutputStream
 import java.io.IOException
 import java.util.UUID
 
+/** Longest message a passenger can send to the radio. */
+const val MAX_SAY_LENGTH = 140
+
+/** A message as the radio shows and speaks it: one line, trimmed and capped; null when nothing is left. */
+fun cleanSayText(raw: String): String? =
+    raw.replace(Regex("\\s+"), " ").trim().take(MAX_SAY_LENGTH).trim().takeIf { it.isNotEmpty() }
+
+/** Longest name the car keeps for a phone. */
+const val MAX_DEVICE_NAME = 30
+
+/** The name the driver typed for a phone, trimmed and capped; null when there is nothing left. */
+fun cleanDeviceName(raw: String): String? = raw.trim().take(MAX_DEVICE_NAME).trim().takeIf { it.isNotEmpty() }
+
 /** A phone in the car's session, as every participant sees it. */
 data class DeviceInfo(
     val id: String,
@@ -70,6 +83,15 @@ sealed interface Message {
     /** Phone -> car: the song its music app is playing; [art] is a small JPEG in Base64, empty if none. */
     data class NowPlaying(val title: String, val artist: String, val playing: Boolean, val art: String = "") : Message
 
+    /** Phone -> car: the car in view on the phone, as one line of JSON; the radio shows it on "Mi auto". */
+    data class CarData(val json: String) : Message
+
+    /** Car -> phone: that same car after the driver edited it on the radio; the phone keeps the result. */
+    data class CarUpdate(val json: String) : Message
+
+    /** Phone -> car: a line the passenger typed; the radio shows it and reads it aloud. */
+    data class Say(val text: String) : Message
+
     /** Phone -> car: whether this phone is capturing its audio. */
     data class AudioState(val sharing: Boolean) : Message
 
@@ -111,7 +133,7 @@ object AudioSpec {
 }
 
 object Protocol {
-    const val VERSION = 4
+    const val VERSION = 6
     const val SERVICE_TYPE = "_autoplay._tcp."
     const val DEFAULT_PORT = 47800
 
@@ -136,6 +158,9 @@ object Protocol {
     private const val NOTICE = 14
     private const val MEDIA_COMMAND = 15
     private const val NOW_PLAYING = 16
+    private const val CAR_DATA = 17
+    private const val CAR_UPDATE = 18
+    private const val SAY = 19
 
     fun write(out: DataOutputStream, message: Message) {
         val (type, payload) = when (message) {
@@ -160,6 +185,9 @@ object Protocol {
         is Message.Roster -> ROSTER to listOf(message.playingId ?: "", message.volume.toString(), message.carName) + message.devices.flatMap {
             listOf(it.id, it.name, flag(it.online), flag(it.sharing), flag(it.bluetooth), flag(it.muted), flag(it.volumeLocked))
         }
+        is Message.CarData -> CAR_DATA to listOf(message.json)
+        is Message.CarUpdate -> CAR_UPDATE to listOf(message.json)
+        is Message.Say -> SAY to listOf(message.text)
         is Message.AudioState -> AUDIO_STATE to listOf(flag(message.sharing))
         is Message.Volume -> VOLUME to listOf(message.level.toString())
         Message.VolumeRequest -> VOLUME_REQUEST to emptyList()
@@ -194,6 +222,9 @@ object Protocol {
                 }
                 Message.Roster(devices, field(0).ifEmpty { null }, field(1).toIntOrNull() ?: 100, field(2))
             }
+            CAR_DATA -> Message.CarData(field(0))
+            CAR_UPDATE -> Message.CarUpdate(field(0))
+            SAY -> Message.Say(field(0))
             AUDIO_STATE -> Message.AudioState(field(0) == "1")
             VOLUME -> Message.Volume(field(0).toIntOrNull()?.coerceIn(0, 100) ?: throw IOException("Bad volume"))
             VOLUME_REQUEST -> Message.VolumeRequest

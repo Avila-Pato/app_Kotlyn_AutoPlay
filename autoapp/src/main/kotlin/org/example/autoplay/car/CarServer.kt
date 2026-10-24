@@ -32,6 +32,12 @@ import org.example.autoplay.net.CarDiscovery
 import org.example.autoplay.net.Connection
 import org.example.autoplay.net.DeviceInfo
 import org.example.autoplay.net.MediaAction
+import org.example.autoplay.mycar.MyCar
+import org.example.autoplay.mycar.carFromWire
+import org.example.autoplay.mycar.firstCarSource
+import org.example.autoplay.mycar.toJson
+import org.example.autoplay.net.cleanDeviceName
+import org.example.autoplay.net.cleanSayText
 import org.example.autoplay.net.Message
 import org.example.autoplay.net.Protocol
 import org.example.autoplay.net.localIpv4Address
@@ -49,6 +55,9 @@ data class JoinRequest(val deviceName: String, val address: String?)
 
 /** The song on the phone that has the music; empty fields when its app shares nothing. */
 data class Track(val title: String, val artist: String, val playing: Boolean, val art: Bitmap?)
+
+/** A line a passenger typed on their phone; shown on the radio until it is dismissed or times out. */
+data class IncomingMessage(val id: Long, val deviceName: String, val text: String)
 
 /** A phone with a locked volume asked for more; the driver decides. */
 data class VolumeRequest(val deviceId: String, val deviceName: String)
@@ -78,6 +87,9 @@ data class CarSessionState(
     /** Music volume, 0..100; changed by the phone that plays or on the car screen. */
     val volume: Int = CarServer.DEFAULT_VOLUME,
     val volumeRequest: VolumeRequest? = null,
+    val message: IncomingMessage? = null,
+    /** The car of the first phone in line that sent one; what "Mi auto" shows on the radio. */
+    val myCar: MyCar? = null,
     val track: Track? = null,
 ) {
     val joinLink: JoinLink? get() = host?.takeIf { code.isNotEmpty() }?.let { JoinLink(it, port, code) }
@@ -96,13 +108,16 @@ class CarServer @Inject constructor(
     private val player: AudioPlayer,
     private val trustedPhones: TrustedPhones,
 ) {
-    private class Session(val id: String, val name: String, val token: String, val trust: String) {
+    private class Session(val id: String, var name: String, val token: String, val trust: String) {
+        /** The car this phone has in view, as it last sent it. */
+        var carData: MyCar? = null
         var connection: Connection? = null
         var sharing = false
         var bluetooth = false
         var muted = false
         var volumeLocked = false
         var lastVolumeRequest = 0L
+        var lastSay = 0L
         var track: Track? = null
         var artKey = ""
         var resumeTimeout: Job? = null
@@ -112,6 +127,10 @@ class CarServer @Inject constructor(
     val state: StateFlow<CarSessionState> = _state.asStateFlow()
 
     private val lock = Any()
+
+    init {
+        player.onFocusChange = { change -> onFocusChange(change) }
+    }
     private var scope: CoroutineScope? = null
     private var serverSocket: ServerSocket? = null
     private var bluetoothServer: BluetoothServerSocket? = null
@@ -250,6 +269,17 @@ class CarServer @Inject constructor(
         rosterChanged.trySend(Unit)
     }
 
+    /** The driver gives a phone a name of their own; it is kept for when the phone comes back. */
+    fun renameDevice(deviceId: String, name: String) {
+        val clean = cleanDeviceName(name) ?: return
+        synchronized(lock) {
+            val session = sessions.find { it.id == deviceId } ?: return
+            session.name = clean
+            trustedPhones.setAlias(session.trust, clean)
+        }
+        rosterChanged.trySend(Unit)
+    }
+
     /** A locked phone cannot move the car's volume, only ask for more. */
     fun setVolumeLocked(deviceId: String, locked: Boolean) {
         synchronized(lock) { sessions.find { it.id == deviceId }?.volumeLocked = locked }
@@ -268,8 +298,90 @@ class CarServer @Inject constructor(
 
     /** ⏮ ⏯ ⏭ from the screen or the steering wheel go to the phone that has the music. */
     fun mediaCommand(action: MediaAction) {
+        audioBlocked = false
+        resumeAfterBlock = false
         val connection = synchronized(lock) { currentPlayerLocked()?.connection } ?: return
         scope?.launch { runCatching { connection.send(Message.MediaCommand(action)) } }
+    }
+
+    /** A passenger typed a line: one at a time per phone, so nobody can flood the radio. */
+    private fun onSay(session: Session, raw: String) {
+        val text = cleanSayText(raw) ?: return
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            if (now - session.lastSay < SAY_COOLDOWN_MILLIS) return
+            session.lastSay = now
+        }
+        val incoming = IncomingMessage(now, session.name, text)
+        _state.update { it.copy(message = incoming) }
+        // Nobody read it: it quietly goes away
+        scope?.launch {
+            delay(SAY_TIMEOUT_MILLIS)
+            _state.update { if (it.message === incoming) it.copy(message = null) else it }
+        }
+    }
+
+    fun dismissMessage() {
+        _state.update { it.copy(message = null) }
+    }
+
+    /**
+     * While another app has the audio (the head unit's radio), the phone's music is paused and what it still sends
+     * is dropped. It is let through again when the audio is given back, or when someone presses play.
+     */
+    @Volatile private var audioBlocked = false
+    private var resumeAfterBlock = false
+    private var blockedAt = 0L
+
+    private fun onFocusChange(change: Int) {
+        when (focusAction(change)) {
+            FocusAction.None -> Unit
+            FocusAction.Pause, FocusAction.Stop -> {
+                val stop = focusAction(change) == FocusAction.Stop
+                if (audioBlocked && !stop) return
+                val wasPlaying = synchronized(lock) { currentPlayerLocked() != null } && _state.value.track?.playing != false
+                audioBlocked = true
+                resumeAfterBlock = !stop && wasPlaying
+                blockedAt = System.currentTimeMillis()
+                if (stop) player.stop() else player.pause()
+                // The phone's own player stops too, or it would keep going unheard
+                if (wasPlaying) mediaCommandUnblocked(MediaAction.PlayPause)
+            }
+            FocusAction.Resume -> {
+                if (!audioBlocked) return
+                audioBlocked = false
+                if (resumeAfterBlock) mediaCommandUnblocked(MediaAction.PlayPause)
+                resumeAfterBlock = false
+            }
+        }
+    }
+
+    private fun mediaCommandUnblocked(action: MediaAction) {
+        val connection = synchronized(lock) { currentPlayerLocked()?.connection } ?: return
+        scope?.launch { runCatching { connection.send(Message.MediaCommand(action)) } }
+    }
+
+    /** The phone sent the car it has in view; a message that is not a car is ignored. */
+    private fun onCarData(session: Session, message: Message.CarData) {
+        val car = carFromWire(message.json) ?: return
+        synchronized(lock) { session.carData = car }
+        rosterChanged.trySend(Unit)
+    }
+
+    /**
+     * The driver edited the car on the radio: the change is applied here at once and sent to the phone that
+     * owns it, which keeps it. False when there is no car or [transform] refused (returned null).
+     */
+    fun editMyCar(transform: (MyCar) -> MyCar?): Boolean {
+        val (connection, car) = synchronized(lock) {
+            val source = carSourceLocked() ?: return false
+            val next = transform(source.carData ?: return false) ?: return false
+            source.carData = next
+            source.connection to next
+        }
+        rosterChanged.trySend(Unit)
+        if (connection != null) scope?.launch { runCatching { connection.send(Message.CarUpdate(car.toJson().toString())) } }
+        return true
     }
 
     private fun onNowPlaying(session: Session, song: Message.NowPlaying) {
@@ -282,6 +394,11 @@ class CarServer @Inject constructor(
         synchronized(lock) {
             session.artKey = song.art
             session.track = Track(song.title, song.artist, song.playing, art).takeIf { song.title.isNotEmpty() }
+        }
+        // Someone pressed play on the phone after the radio took the audio: let it through, but ignore what was in flight
+        if (audioBlocked && song.playing && System.currentTimeMillis() - blockedAt > BLOCK_GRACE_MILLIS) {
+            audioBlocked = false
+            resumeAfterBlock = false
         }
         rosterChanged.trySend(Unit)
     }
@@ -372,9 +489,11 @@ class CarServer @Inject constructor(
         var lastPlaying: String? = null
         for (signal in rosterChanged) {
             var track: Track? = null
+            var source: Session? = null
             val (devices, playingId, connections) = synchronized(lock) {
                 val playing = currentPlayerLocked()
                 track = playing?.track
+                source = carSourceLocked()
                 Triple(
                     sessions.map {
                         DeviceInfo(it.id, it.name, it.connection != null, it.sharing, it.bluetooth, it.muted, it.volumeLocked)
@@ -383,7 +502,7 @@ class CarServer @Inject constructor(
                     sessions.mapNotNull { it.connection },
                 )
             }
-            _state.update { it.copy(devices = devices, playingId = playingId, track = track) }
+            _state.update { it.copy(devices = devices, playingId = playingId, track = track, myCar = source?.carData) }
             val volume = _state.value.volume
             if (playingId == null && lastPlaying != null) player.stop()
             lastPlaying = playingId
@@ -458,7 +577,8 @@ class CarServer @Inject constructor(
 
         val trust = if (trusted) hello.trust else trustedPhones.trust(hello.deviceName)
         val session = synchronized(lock) {
-            Session(SessionCode.newResumeToken().take(8), hello.deviceName, SessionCode.newResumeToken(), trust)
+            val name = trustedPhones.aliasFor(trust) ?: hello.deviceName
+            Session(SessionCode.newResumeToken().take(8), name, SessionCode.newResumeToken(), trust)
                 .also { sessions.add(it) }
         }
         try {
@@ -503,8 +623,8 @@ class CarServer @Inject constructor(
         try {
             while (true) {
                 when (val message = connection.receive()) {
-                    is Message.Audio -> if (isPlaying(session)) player.write(session.id, message.pcm)
-                    is Message.AudioAac -> if (isPlaying(session)) {
+                    is Message.Audio -> if (isPlaying(session) && !audioBlocked) player.write(session.id, message.pcm)
+                    is Message.AudioAac -> if (isPlaying(session) && !audioBlocked) {
                         val aac = decoder ?: AacDecoder().also { decoder = it }
                         aac.decode(message.frame) { pcm -> player.write(session.id, pcm) }
                     }
@@ -512,6 +632,8 @@ class CarServer @Inject constructor(
                     is Message.Volume -> if (isPlaying(session) && !synchronized(lock) { session.volumeLocked }) setVolume(message.level)
                     Message.VolumeRequest -> onVolumeRequest(session)
                     is Message.NowPlaying -> onNowPlaying(session, message)
+                    is Message.CarData -> onCarData(session, message)
+                    is Message.Say -> onSay(session, message.text)
                     is Message.AudioState -> {
                         synchronized(lock) { session.sharing = message.sharing }
                         rosterChanged.trySend(Unit)
@@ -542,6 +664,10 @@ class CarServer @Inject constructor(
 
     private fun currentPlayerLocked() = sessions.firstOrNull { it.connection != null && it.sharing && !it.muted }
 
+    /** First phone in priority order that is online and has sent its car. */
+    private fun carSourceLocked(): Session? =
+        firstCarSource(sessions.map { if (it.connection != null) it.carData else null })?.let { sessions[it] }
+
     /** Keeps the phone's place for a while so it can come back with its resume token. */
     private fun onConnectionLost(session: Session) {
         rosterChanged.trySend(Unit)
@@ -564,6 +690,9 @@ class CarServer @Inject constructor(
         private const val BLUETOOTH_RETRY_SECONDS = 5
         private const val VOLUME_REQUEST_STEP = 10
         private const val VOLUME_REQUEST_COOLDOWN_MILLIS = 30_000L
+        private const val SAY_COOLDOWN_MILLIS = 5_000L
+        private const val SAY_TIMEOUT_MILLIS = 20_000L
+        private const val BLOCK_GRACE_MILLIS = 1_500L
         private const val VOLUME_REQUEST_TIMEOUT_MILLIS = 20_000L
 
         private val ACCEPTED_REPLIES = listOf(

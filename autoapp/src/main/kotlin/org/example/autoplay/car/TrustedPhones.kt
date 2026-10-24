@@ -25,11 +25,19 @@ class TrustedPhones @Inject constructor(@ApplicationContext context: Context) {
         SessionCode.newResumeToken().also { prefs.edit().putString(PREFIX + it, deviceName).apply() }
 
     fun forget(token: String) {
-        prefs.edit().remove(PREFIX + token).apply()
+        prefs.edit().remove(PREFIX + token).remove(ALIAS + token).apply()
+    }
+
+    /** The name the driver gave this phone from the car screen, which wins over the phone's own. */
+    fun aliasFor(token: String): String? = if (token.isEmpty()) null else prefs.getString(ALIAS + token, null)
+
+    fun setAlias(token: String, name: String) {
+        if (token.isNotEmpty()) prefs.edit().putString(ALIAS + token, name).apply()
     }
 
     private companion object {
         const val KEY_CAR_ID = "car_id"
         const val PREFIX = "phone_"
+        const val ALIAS = "alias_"
     }
 }

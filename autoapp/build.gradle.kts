@@ -22,6 +22,13 @@ android {
         versionName = "0.1"
     }
 
+    // "personal" starts with the data of the driver's own car; "clean" carries no data of anyone
+    flavorDimensions += "data"
+    productFlavors {
+        create("personal") { dimension = "data" }
+        create("clean") { dimension = "data" }
+    }
+
     buildFeatures {
         compose = true
     }
@@ -55,6 +62,8 @@ dependencies {
     implementation("androidx.camera:camera-view:1.6.2")
 
     testImplementation("org.junit.jupiter:junit-jupiter:6.0.1")
+    // org.json is only a stub in the Android jar; unit tests of the car JSON need the real one
+    testImplementation("org.json:json:20250517")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

@@ -8,7 +8,9 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.example.autoplay.net.MediaAction
 import javax.inject.Inject
@@ -16,10 +18,16 @@ import javax.inject.Inject
 @HiltViewModel
 class CarViewModel @Inject constructor(
     private val server: CarServer,
+    private val appsStore: CarAppsStore,
+    private val announcer: Announcer,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     val state: StateFlow<CarSessionState> = server.state
+    val apps: StateFlow<List<String>> = appsStore.packages
+    val voiceAlerts: StateFlow<Boolean> = announcer.enabled
     private val prefs = context.getSharedPreferences("car", Context.MODE_PRIVATE)
+    private val _effects = MutableStateFlow(prefs.getBoolean(KEY_EFFECTS, true))
+    val effects: StateFlow<Boolean> = _effects.asStateFlow()
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -34,6 +42,15 @@ class CarViewModel @Inject constructor(
     fun newCode() = server.newCode()
     fun startBluetooth() = server.startBluetooth()
     fun setVolume(level: Int) = server.setVolume(level)
+    fun setApps(packages: List<String>) = appsStore.setPackages(packages)
+    fun setVoiceAlerts(on: Boolean) = announcer.setEnabled(on)
+    fun dismissMessage() = server.dismissMessage()
+
+    /** Cover colors and animations in the player; off for radios that struggle with them. */
+    fun setEffects(on: Boolean) {
+        _effects.value = on
+        prefs.edit().putBoolean(KEY_EFFECTS, on).apply()
+    }
 
     fun rename(name: String) {
         val clean = name.trim().take(MAX_NAME_LENGTH)
@@ -43,6 +60,7 @@ class CarViewModel @Inject constructor(
     }
     fun move(deviceId: String, position: Int) = server.move(deviceId, position)
     fun setMuted(deviceId: String, muted: Boolean) = server.setMuted(deviceId, muted)
+    fun renameDevice(deviceId: String, name: String) = server.renameDevice(deviceId, name)
     fun setVolumeLocked(deviceId: String, locked: Boolean) = server.setVolumeLocked(deviceId, locked)
     fun answerVolumeRequest(accept: Boolean) = server.answerVolumeRequest(accept)
     fun mediaCommand(action: MediaAction) = server.mediaCommand(action)
@@ -60,11 +78,12 @@ class CarViewModel @Inject constructor(
         val name = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)?.trim().orEmpty()
         val codenames = setOf(Build.MODEL, Build.DEVICE, Build.PRODUCT, Build.BOARD, Build.HARDWARE)
         val readable = name.isNotEmpty() && '_' !in name && codenames.none { it.equals(name, ignoreCase = true) }
-        return if (readable) name else "Mi auto"
+        return if (readable) name else "Radio del auto"
     }
 
     private companion object {
         const val KEY_NAME = "name"
         const val MAX_NAME_LENGTH = 30
+        const val KEY_EFFECTS = "effects"
     }
 }

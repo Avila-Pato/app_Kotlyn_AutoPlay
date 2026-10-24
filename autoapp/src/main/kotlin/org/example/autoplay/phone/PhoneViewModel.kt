@@ -160,6 +160,7 @@ class PhoneViewModel @Inject constructor(
 
     fun setCarVolume(level: Int) = client.setCarVolume(level)
     fun askForMoreVolume() = client.askForMoreVolume()
+    fun say(text: String): Boolean = client.say(text)
     fun clearNotice() = client.clearNotice()
 
     fun hasMediaAccess() = media.hasAccess()

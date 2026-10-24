@@ -14,14 +14,20 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.example.autoplay.mycar.MyCarStore
+import org.example.autoplay.mycar.carFromWire
+import org.example.autoplay.mycar.toJson
 import org.example.autoplay.net.AacEncoder
 import org.example.autoplay.net.Connection
 import org.example.autoplay.net.DeviceInfo
 import org.example.autoplay.net.Message
 import org.example.autoplay.net.Protocol
+import org.example.autoplay.net.cleanSayText
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -71,6 +77,7 @@ class PhoneClient @Inject constructor(
     @ApplicationContext private val context: Context,
     private val knownCars: KnownCars,
     private val media: PhoneMedia,
+    private val myCars: MyCarStore,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _status = MutableStateFlow<PhoneStatus>(PhoneStatus.Disconnected)
@@ -158,6 +165,13 @@ class PhoneClient @Inject constructor(
     /** With the volume locked, all a passenger can do is ask nicely. */
     fun askForMoreVolume() = sendInBackground(Message.VolumeRequest)
 
+    /** A line for the radio to show and read aloud; false when there was nothing to send. */
+    fun say(text: String): Boolean {
+        val clean = cleanSayText(text) ?: return false
+        sendInBackground(Message.Say(clean))
+        return true
+    }
+
     fun clearNotice() {
         _notice.value = null
     }
@@ -243,10 +257,19 @@ class PhoneClient @Inject constructor(
                 conn.close()
             }
         }
+        // The car in view goes to the radio now, after a reconnect, and whenever it or the choice changes
+        val cars = launch {
+            try {
+                myCars.garage.map { it.selected }.distinctUntilChanged().collect { car -> conn.send(Message.CarData(car.toJson().toString())) }
+            } catch (e: IOException) {
+                conn.close()
+            }
+        }
         try {
             while (true) {
                 val message = conn.receive()
                 if (message == Message.Bye) break
+                if (message is Message.CarUpdate) carFromWire(message.json)?.let(myCars::replaceCar)
                 // Pongs only keep the read timeout from firing
                 if (message is Message.Notice) _notice.value = message.text
                 if (message is Message.MediaCommand) media.command(message.action)
@@ -265,6 +288,7 @@ class PhoneClient @Inject constructor(
         } finally {
             pinger.cancel()
             songs.cancel()
+            cars.cancel()
             conn.close()
         }
     }

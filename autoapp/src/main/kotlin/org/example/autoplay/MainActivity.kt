@@ -18,6 +18,7 @@ import dagger.hilt.android.AndroidEntryPoint
 import org.example.autoplay.car.CarScreen
 import org.example.autoplay.car.CarServer
 import org.example.autoplay.car.NavigationMode
+import org.example.autoplay.mycar.MyCarScreen
 import org.example.autoplay.phone.PhoneClient
 import org.example.autoplay.phone.PhoneScreen
 import org.example.autoplay.phone.PhoneStatus
@@ -72,8 +73,21 @@ class MainActivity : ComponentActivity() {
                         composable("home") {
                             HomeScreen(onCar = { switchTo(DeviceRole.Car) }, onPhone = { switchTo(DeviceRole.Phone) })
                         }
-                        composable("car") { CarScreen(onBack = leave, onUseAsPhone = { switchTo(DeviceRole.Phone) }) }
-                        composable("phone") { PhoneScreen(onBack = leave, onUseAsCar = { switchTo(DeviceRole.Car) }) }
+                        composable("car") {
+                            CarScreen(
+                                onBack = leave,
+                                onUseAsPhone = { switchTo(DeviceRole.Phone) },
+                                onMyCar = { nav.navigate("mycar") },
+                            )
+                        }
+                        composable("phone") {
+                            PhoneScreen(
+                                onBack = leave,
+                                onUseAsCar = { switchTo(DeviceRole.Car) },
+                                onMyCar = { nav.navigate("mycar") },
+                            )
+                        }
+                        composable("mycar") { MyCarScreen(onBack = { nav.popBackStack() }) }
                     }
                 }
             }
