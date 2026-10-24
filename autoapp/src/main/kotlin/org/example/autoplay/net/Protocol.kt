@@ -1,0 +1,164 @@
+package org.example.autoplay.net
+
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.IOException
+import java.util.UUID
+
+/** A phone in the car's session, as every participant sees it. */
+data class DeviceInfo(
+    val id: String,
+    val name: String,
+    val online: Boolean,
+    /** The phone granted audio capture, so it can play music in the car. */
+    val sharing: Boolean,
+    val bluetooth: Boolean = false,
+)
+
+/**
+ * Messages exchanged between phone and car, over TCP (Wi-Fi) or RFCOMM (Bluetooth).
+ * Wire format of each frame: [type: 1 byte][payload length: 4 bytes][payload].
+ */
+sealed interface Message {
+    /** Phone -> car: first contact with the 6-digit session code. */
+    data class Hello(val version: Int, val code: String, val deviceName: String) : Message
+
+    /** Phone -> car: reconnect after a dropped connection without asking for approval again. */
+    data class Resume(val token: String) : Message
+
+    /** Car -> phone: the connection was approved; [token] allows resuming it later, [deviceId] names this phone. */
+    data class Accepted(val token: String, val carName: String, val deviceId: String) : Message
+
+    data class Rejected(val reason: String) : Message
+
+    /** Car -> phones: connected devices in priority order; the first online one that shares audio plays music. */
+    data class Roster(val devices: List<DeviceInfo>, val playingId: String?, val volume: Int = 100) : Message
+
+    /** Phone playing music -> car: music volume in the car, 0..100. */
+    data class Volume(val level: Int) : Message
+
+    /** Phone -> car: whether this phone is capturing its audio. */
+    data class AudioState(val sharing: Boolean) : Message
+
+    /** Phone -> car: raw PCM described by [AudioSpec]. */
+    class Audio(val pcm: ByteArray) : Message {
+        override fun equals(other: Any?) = other is Audio && pcm.contentEquals(other.pcm)
+        override fun hashCode() = pcm.contentHashCode()
+    }
+
+    /** Phone -> car over Bluetooth, which is too slow for PCM: one raw AAC-LC access unit per message. */
+    class AudioAac(val frame: ByteArray) : Message {
+        override fun equals(other: Any?) = other is AudioAac && frame.contentEquals(other.frame)
+        override fun hashCode() = frame.contentHashCode()
+    }
+
+    data object Ping : Message
+    data object Pong : Message
+
+    /** Either side: the user ended the session. */
+    data object Bye : Message
+}
+
+/** The single audio format used end to end, so no negotiation or resampling is needed. */
+object AudioSpec {
+    const val SAMPLE_RATE = 48_000
+    const val CHANNELS = 2
+    const val BYTES_PER_FRAME = CHANNELS * 2 // 16-bit PCM
+
+    /** 20 ms per network frame keeps latency low without flooding the socket with tiny writes. */
+    const val CHUNK_BYTES = SAMPLE_RATE / 50 * BYTES_PER_FRAME
+
+    const val AAC_MIME = "audio/mp4a-latm"
+    const val AAC_BIT_RATE = 128_000
+
+    /** AudioSpecificConfig for AAC-LC, 48 kHz, stereo; fixed, so it never has to be sent. */
+    val AAC_CONFIG = byteArrayOf(0x11, 0x90.toByte())
+}
+
+object Protocol {
+    const val VERSION = 3
+    const val SERVICE_TYPE = "_autoplay._tcp."
+    const val DEFAULT_PORT = 47800
+
+    /** RFCOMM service the car listens on when there is no Wi-Fi. */
+    val BLUETOOTH_UUID: UUID = UUID.fromString("6f1d2a5e-3c8b-4e1a-9d7f-2b4c6a8e0f13")
+
+    private const val MAX_PAYLOAD = 8 * 1024 * 1024
+
+    private const val HELLO = 1
+    private const val RESUME = 2
+    private const val ACCEPTED = 3
+    private const val REJECTED = 4
+    private const val PING = 5
+    private const val PONG = 6
+    private const val BYE = 7
+    private const val ROSTER = 8
+    private const val AUDIO_STATE = 9
+    private const val AUDIO = 10
+    private const val AUDIO_AAC = 11
+    private const val VOLUME = 12
+
+    fun write(out: DataOutputStream, message: Message) {
+        val (type, payload) = when (message) {
+            is Message.Audio -> AUDIO to message.pcm
+            is Message.AudioAac -> AUDIO_AAC to message.frame
+            else -> {
+                val (type, fields) = fieldsOf(message)
+                type to fields.joinToString("\n") { it.replace('\n', ' ') }.toByteArray(Charsets.UTF_8)
+            }
+        }
+        out.writeByte(type)
+        out.writeInt(payload.size)
+        out.write(payload)
+        out.flush()
+    }
+
+    private fun fieldsOf(message: Message): Pair<Int, List<String>> = when (message) {
+        is Message.Hello -> HELLO to listOf(message.version.toString(), message.code, message.deviceName)
+        is Message.Resume -> RESUME to listOf(message.token)
+        is Message.Accepted -> ACCEPTED to listOf(message.token, message.carName, message.deviceId)
+        is Message.Rejected -> REJECTED to listOf(message.reason)
+        is Message.Roster -> ROSTER to listOf(message.playingId ?: "", message.volume.toString()) + message.devices.flatMap {
+            listOf(it.id, it.name, flag(it.online), flag(it.sharing), flag(it.bluetooth))
+        }
+        is Message.AudioState -> AUDIO_STATE to listOf(flag(message.sharing))
+        is Message.Volume -> VOLUME to listOf(message.level.toString())
+        is Message.Audio, is Message.AudioAac -> error("Audio is binary")
+        Message.Ping -> PING to emptyList()
+        Message.Pong -> PONG to emptyList()
+        Message.Bye -> BYE to emptyList()
+    }
+
+    fun read(input: DataInputStream): Message {
+        val type = input.readUnsignedByte()
+        val size = input.readInt()
+        if (size !in 0..MAX_PAYLOAD) throw IOException("Invalid frame size $size")
+        val payload = ByteArray(size).also(input::readFully)
+        if (type == AUDIO) return Message.Audio(payload)
+        if (type == AUDIO_AAC) return Message.AudioAac(payload)
+
+        val fields = String(payload, Charsets.UTF_8).split("\n")
+        fun field(i: Int) = fields.getOrNull(i) ?: throw IOException("Missing field $i in frame $type")
+
+        return when (type) {
+            HELLO -> Message.Hello(field(0).toIntOrNull() ?: 0, field(1), field(2))
+            RESUME -> Message.Resume(field(0))
+            ACCEPTED -> Message.Accepted(field(0), field(1), field(2))
+            REJECTED -> Message.Rejected(field(0))
+            ROSTER -> {
+                val devices = fields.drop(2).chunked(5).filter { it.size == 5 }.map { (id, name, online, sharing, bluetooth) ->
+                    DeviceInfo(id, name, online == "1", sharing == "1", bluetooth == "1")
+                }
+                Message.Roster(devices, field(0).ifEmpty { null }, field(1).toIntOrNull() ?: 100)
+            }
+            AUDIO_STATE -> Message.AudioState(field(0) == "1")
+            VOLUME -> Message.Volume(field(0).toIntOrNull()?.coerceIn(0, 100) ?: throw IOException("Bad volume"))
+            PING -> Message.Ping
+            PONG -> Message.Pong
+            BYE -> Message.Bye
+            else -> throw IOException("Unknown frame type $type")
+        }
+    }
+
+    private fun flag(value: Boolean) = if (value) "1" else "0"
+}
