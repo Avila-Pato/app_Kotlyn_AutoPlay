@@ -37,8 +37,8 @@ class CarService : Service() {
             if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0,
         )
         scope.launch {
-            server.state.map { it.running to notificationText(it) }.distinctUntilChanged().collect { (running, text) ->
-                if (running) SessionNotification.update(this@CarService, notification(text)) else stopSelf()
+            server.state.map { it.running to "${it.carName}\n${notificationText(it)}" }.distinctUntilChanged().collect { (running, text) ->
+                if (running) SessionNotification.update(this@CarService, notification(text.substringAfter('\n'))) else stopSelf()
             }
         }
     }
@@ -55,7 +55,7 @@ class CarService : Service() {
 
     private fun notification(text: String) = SessionNotification.build(
         this,
-        title = "AutoPlay activo en el auto",
+        title = server.state.value.carName.ifEmpty { "AutoPlay" },
         text = text,
         stopIntent = Intent(this, CarService::class.java).setAction(ACTION_STOP),
     )
@@ -65,8 +65,8 @@ class CarService : Service() {
         val playing = state.playing?.name
         return when {
             online == 0 -> "Esperando celulares"
-            playing != null -> "Suena la música de $playing · $online conectado(s)"
-            else -> "$online celular(es) conectado(s)"
+            playing != null -> "Sonando: $playing"
+            else -> "$online conectado${if (online == 1) "" else "s"}"
         }
     }
 

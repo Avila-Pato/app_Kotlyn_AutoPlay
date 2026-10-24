@@ -11,4 +11,4 @@ plugins {
 }
 
 rootProject.name = "auto_play"
-include("app", "list", "utilities", "autoapp")
+include("autoapp")

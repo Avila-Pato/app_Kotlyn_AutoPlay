@@ -27,13 +27,14 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -43,6 +44,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -52,9 +54,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
 import org.example.autoplay.net.DiscoveredCar
 import org.example.autoplay.ui.AppColors
 import org.example.autoplay.ui.AppIcons
@@ -88,6 +93,14 @@ fun PhoneScreen(onBack: () -> Unit, viewModel: PhoneViewModel = hiltViewModel())
     val room by viewModel.room.collectAsStateWithLifecycle()
     val sharing by viewModel.sharingAudio.collectAsStateWithLifecycle()
     val requestAudio = rememberAudioRequest(viewModel::shareAudio)
+    val notice by viewModel.notice.collectAsStateWithLifecycle()
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            delay(NOTICE_MILLIS)
+            viewModel.clearNotice()
+        }
+    }
+    val volume = CarVolume(viewModel::setCarVolume, viewModel::askForMoreVolume, notice)
 
     // Right after joining, ask once for audio so the user does not have to find the button
     val connected = status is PhoneStatus.Connected
@@ -101,9 +114,9 @@ fun PhoneScreen(onBack: () -> Unit, viewModel: PhoneViewModel = hiltViewModel())
 
     when (val s = status) {
         is PhoneStatus.Connected ->
-            SessionView(s.carName, reconnectAttempt = null, room, sharing, requestAudio, viewModel::setCarVolume, viewModel::disconnect)
+            SessionView(s.carName, reconnectAttempt = null, room, sharing, requestAudio, volume, viewModel::disconnect)
         is PhoneStatus.Reconnecting ->
-            SessionView(s.carName, reconnectAttempt = s.attempt, room, sharing, requestAudio, viewModel::setCarVolume, viewModel::disconnect)
+            SessionView(s.carName, reconnectAttempt = s.attempt, room, sharing, requestAudio, volume, viewModel::disconnect)
         else -> JoinView(status, viewModel, onBack, onScan = { scanning = true })
     }
 }
@@ -115,6 +128,7 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
     val busy = status == PhoneStatus.Connecting || status == PhoneStatus.WaitingApproval
     val canJoin = code.length == 6 && !busy
     var method by rememberSaveable { mutableStateOf(JoinMethod.Wifi) }
+    val myCars by viewModel.myCars.collectAsStateWithLifecycle()
 
     Column(Modifier.fillMaxSize()) {
         ScreenHeader(title = "Unirse al auto", subtitle = "Conecta este celular para poner tu música", onBack = onBack)
@@ -127,6 +141,7 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             StatusFor(status)
+            if (myCars.isNotEmpty()) MyCars(myCars, enabled = !busy, onConnect = viewModel::connectKnown, onForget = viewModel::forgetCar)
             MethodSelector(method, enabled = !busy, onSelect = { method = it })
             when (method) {
                 JoinMethod.Wifi -> {
@@ -136,14 +151,42 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
                     NearbyCars(cars, codeComplete = code.length == 6, enabled = canJoin, onSelect = viewModel::connectTo)
                     ManualConnection(viewModel, enabled = canJoin)
                 }
-                JoinMethod.Bluetooth -> {
-                    Text(
-                        "Código que aparece en la pantalla del auto",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    CodeInput(code, viewModel::onCodeChange, enabled = !busy)
-                    BluetoothDevices(viewModel, codeComplete = code.length == 6, enabled = canJoin)
+                JoinMethod.Bluetooth -> BluetoothDevices(viewModel, enabled = !busy)
+            }
+        }
+    }
+}
+
+/** Cars that approved this phone before: one tap, no code. */
+@Composable
+private fun MyCars(cars: List<KnownCar>, enabled: Boolean, onConnect: (KnownCar) -> Unit, onForget: (KnownCar) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Mis autos", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        cars.forEach { car ->
+            Card(
+                onClick = { onConnect(car) },
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.medium,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+            ) {
+                Row(
+                    Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconBadge(AppIcons.Car, MaterialTheme.colorScheme.primary, size = 40.dp)
+                    Column(Modifier.weight(1f)) {
+                        Text(car.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            if (car.target is CarTarget.Bluetooth) "Bluetooth · sin código" else "Wi-Fi · sin código",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(onClick = { onForget(car) }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Olvidar", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
         }
@@ -153,11 +196,11 @@ private fun JoinView(status: PhoneStatus, viewModel: PhoneViewModel, onBack: () 
 private enum class JoinMethod(val title: String, val description: String) {
     Wifi(
         "Wi-Fi",
-        "Mejor sonido. El celular y el auto en la misma red Wi-Fi, o el auto conectado al hotspot del celular (no gasta datos).",
+        "Mejor sonido. Misma red o hotspot del celular.",
     ),
     Bluetooth(
         "Bluetooth",
-        "Para cuando no hay Wi-Fi. La radio del auto debe estar emparejada con este celular. El sonido viaja comprimido.",
+        "Sin Wi-Fi ni código. La radio debe estar emparejada.",
     ),
 }
 
@@ -286,25 +329,27 @@ private fun NearbyCars(cars: List<DiscoveredCar>, codeComplete: Boolean, enabled
 }
 
 @Composable
-private fun BluetoothDevices(viewModel: PhoneViewModel, codeComplete: Boolean, enabled: Boolean) {
+private fun BluetoothDevices(viewModel: PhoneViewModel, enabled: Boolean) {
     val context = LocalContext.current
     val devices by viewModel.pairedDevices.collectAsStateWithLifecycle()
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) viewModel.refreshPairedDevices()
     }
     LaunchedEffect(Unit) {
-        if (viewModel.hasBluetoothPermission()) {
-            viewModel.refreshPairedDevices()
-        } else if (Build.VERSION.SDK_INT >= 31) {
+        if (!viewModel.hasBluetoothPermission() && Build.VERSION.SDK_INT >= 31) {
             permissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
         }
+    }
+    // Coming back from the Bluetooth settings after pairing shows the new device right away
+    LifecycleResumeEffect(Unit) {
+        viewModel.refreshPairedDevices()
+        onPauseOrDispose {}
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("Equipos emparejados", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
         Text(
-            if (codeComplete) "Toca la radio del auto en la lista de equipos emparejados."
-            else "Escribe el código de 6 dígitos y luego toca la radio del auto.",
+            "Toca la radio del auto. Sin código: el auto solo te pedirá Permitir la primera vez.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -318,33 +363,17 @@ private fun BluetoothDevices(viewModel: PhoneViewModel, codeComplete: Boolean, e
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
-        devices.orEmpty().forEach { device ->
-            Card(
-                onClick = { viewModel.connectBluetooth(device) },
-                enabled = enabled,
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.medium,
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-            ) {
-                Row(
-                    Modifier.padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconBadge(
-                        if (device.looksLikeCar) AppIcons.Car else AppIcons.Bluetooth,
-                        MaterialTheme.colorScheme.primary,
-                        size = 40.dp,
-                    )
-                    Column(Modifier.weight(1f)) {
-                        Text(device.name, style = MaterialTheme.typography.titleSmall)
-                        Text(
-                            if (device.looksLikeCar) "Radio de auto · Bluetooth" else "Bluetooth",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Conectar")
+        // Only what is likely the car stays visible; the rest is one tap away
+        val (main, others) = devices.orEmpty().partition { it.relevant }
+        var showOthers by rememberSaveable { mutableStateOf(false) }
+        main.forEach { PairedDeviceCard(it, enabled) { viewModel.connectBluetooth(it) } }
+        if (others.isNotEmpty()) {
+            if (main.isEmpty() || showOthers) {
+                others.forEach { PairedDeviceCard(it, enabled) { viewModel.connectBluetooth(it) } }
+            }
+            if (main.isNotEmpty()) {
+                TextButton(onClick = { showOthers = !showOthers }) {
+                    Text(if (showOthers) "Ocultar otros equipos" else "Otros equipos (${others.size})")
                 }
             }
         }
@@ -352,6 +381,40 @@ private fun BluetoothDevices(viewModel: PhoneViewModel, codeComplete: Boolean, e
             onClick = { context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Emparejar un equipo nuevo") }
+    }
+}
+
+@Composable
+private fun PairedDeviceCard(device: PairedDevice, enabled: Boolean, onClick: () -> Unit) {
+    val (detail, accent) = when {
+        device.connected -> "Conectado ahora" to AppColors.Success
+        device.lastUsed > 0 -> "Usado recientemente" to MaterialTheme.colorScheme.primary
+        device.looksLikeCar -> "Radio de auto" to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> "Bluetooth" to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Card(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Row(
+            Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconBadge(
+                if (device.looksLikeCar) AppIcons.Car else AppIcons.Bluetooth,
+                MaterialTheme.colorScheme.primary,
+                size = 40.dp,
+            )
+            Column(Modifier.weight(1f)) {
+                Text(device.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(detail, style = MaterialTheme.typography.bodySmall, color = accent)
+            }
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Conectar")
+        }
     }
 }
 
@@ -388,135 +451,134 @@ private fun SessionView(
     room: CarRoom?,
     sharing: Boolean,
     onShareAudio: () -> Unit,
-    onCarVolume: (Int) -> Unit,
+    volume: CarVolume,
     onDisconnect: () -> Unit,
 ) {
+    val reconnecting = reconnectAttempt != null
     Column(Modifier.fillMaxSize()) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+            Modifier.fillMaxWidth().padding(start = 24.dp, end = 12.dp, top = 16.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(carName, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                if (reconnectAttempt == null) {
-                    StatusChip("Conectado", Tone.Success)
-                } else {
-                    StatusChip("Reconectando · intento $reconnectAttempt", Tone.Warning)
-                }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (reconnecting) "Reconectando…" else "Conectado a",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (reconnecting) AppColors.Warning else AppColors.Success,
+                )
+                Text(
+                    carName,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
-            OutlinedButton(onClick = onDisconnect) {
-                Text("Desconectar", color = MaterialTheme.colorScheme.error)
-            }
+            TextButton(onClick = onDisconnect) { Text("Salir", color = MaterialTheme.colorScheme.error) }
         }
 
         Column(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .padding(horizontal = 24.dp)
+                .padding(top = 8.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(28.dp),
         ) {
-            ConnectedCard(reconnectAttempt != null, room, sharing, onCarVolume)
-            if (!sharing) AudioCard(onShareAudio)
-            BackgroundHint()
-            SectionCard(Modifier.fillMaxWidth()) {
-                DeviceList(room?.devices.orEmpty(), room?.playingId, selfId = room?.selfId)
-            }
+            NowPlaying(reconnecting, room, sharing, onShareAudio, volume)
+            DeviceList(room?.devices.orEmpty(), room?.playingId, selfId = room?.selfId)
+            Text(
+                "Puedes salir de la app: la conexión sigue activa.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
     }
 }
 
+/** What a passenger can do with the car's volume; [notice] is the driver's latest reply. */
+private class CarVolume(val onChange: (Int) -> Unit, val onAskForMore: () -> Unit, val notice: String?)
+
+/** The one thing that matters right now: is my music playing, and what can I do about it. */
 @Composable
-private fun ConnectedCard(reconnecting: Boolean, room: CarRoom?, sharing: Boolean, onCarVolume: (Int) -> Unit) {
-    val playingOther = room?.playing?.takeIf { !room.isPlaying }
-    val (title, text) = when {
-        reconnecting -> "Se cortó la señal" to "Reconectando con el auto…"
-        room?.isPlaying == true -> "Tu música suena en el auto" to
-            "Abre YouTube, Spotify o cualquier app y dale play. El celular queda en silencio y sus teclas de volumen controlan el auto."
-        !sharing -> "Estás conectado" to "Activa el audio para que tu música pueda sonar en el auto."
-        playingOther != null -> "Estás conectado" to
-            "Ahora suena la música de ${playingOther.name}. El auto decide quién pone la música; cuando sea tu turno sonará la tuya."
-        else -> "Estás conectado" to "Esperando a que el auto te dé el turno para poner música."
+private fun NowPlaying(
+    reconnecting: Boolean,
+    room: CarRoom?,
+    sharing: Boolean,
+    onShareAudio: () -> Unit,
+    volume: CarVolume,
+) {
+    val playingHere = room?.isPlaying == true
+    val muted = room?.self?.muted == true
+    val locked = room?.self?.volumeLocked == true
+    val other = room?.playing?.takeIf { !playingHere }
+    val supported = Build.VERSION.SDK_INT >= 29
+    val (title, subtitle) = when {
+        reconnecting -> "Se cortó la señal" to "Volviendo a conectar…"
+        !sharing -> "Audio desactivado" to if (supported) "Actívalo para sonar en el auto" else "Requiere Android 10 o más reciente"
+        muted -> "Te pusieron en mute 🤐" to "El conductor eligió otra música"
+        playingHere -> "Sonando en el auto" to "Dale play en cualquier app"
+        other != null -> "En espera" to "Ahora suena ${other.name}"
+        else -> "En espera" to "El auto elige quién pone la música"
     }
+    val accent = when {
+        reconnecting -> AppColors.Warning
+        playingHere -> AppColors.Success
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
     SectionCard(Modifier.fillMaxWidth()) {
         Column(
             Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (reconnecting) {
-                CircularProgressIndicator(Modifier.size(56.dp), color = AppColors.Warning)
+                CircularProgressIndicator(Modifier.size(56.dp), color = accent)
             } else {
-                IconBadge(if (room?.isPlaying == true) AppIcons.MusicNote else Icons.Filled.Check, AppColors.Success, size = 72.dp)
+                IconBadge(if (sharing) AppIcons.MusicNote else AppIcons.MusicOff, accent, size = 64.dp)
             }
-            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
-            Text(
-                text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-            )
-            if (room?.isPlaying == true && !reconnecting) {
-                Text("Volumen en el auto", style = MaterialTheme.typography.labelLarge)
-                VolumeSlider(room.volume, onCarVolume)
+            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            when {
+                reconnecting -> Unit
+                !sharing && supported -> Button(onClick = onShareAudio, modifier = Modifier.fillMaxWidth()) { Text("Activar audio") }
+                playingHere && locked -> AskForVolume(volume.onAskForMore)
+                playingHere -> VolumeSlider(room.volume, volume.onChange, Modifier.padding(top = 6.dp))
             }
-        }
-    }
-}
-
-@Composable
-private fun AudioCard(onShareAudio: () -> Unit) {
-    val supported = Build.VERSION.SDK_INT >= 29
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer,
-            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-        ),
-    ) {
-        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconBadge(AppIcons.MusicOff, MaterialTheme.colorScheme.primary, size = 48.dp)
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Audio desactivado", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        if (supported) {
-                            "Android te pedirá permiso para «compartir la pantalla»: AutoPlay solo usa el sonido, nunca la imagen."
-                        } else {
-                            "Tu versión de Android no permite enviar el audio de otras apps (necesita Android 10 o más reciente)."
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
-            if (supported) {
-                Button(onClick = onShareAudio, modifier = Modifier.fillMaxWidth()) { Text("Activar audio") }
+            volume.notice?.let {
+                Text(it, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
             }
         }
     }
 }
 
+/** The driver holds the volume; the passenger can ask, but not too often. */
 @Composable
-private fun BackgroundHint() {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(MaterialTheme.shapes.medium)
-            .background(MaterialTheme.colorScheme.surfaceContainerLow)
-            .padding(14.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(Icons.Filled.Info, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
-        Text(
-            "Ya puedes salir de la app: la conexión sigue activa y la verás en la barra de notificaciones.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+private fun AskForVolume(onAsk: () -> Unit) {
+    var waiting by remember { mutableStateOf(false) }
+    LaunchedEffect(waiting) {
+        if (waiting) {
+            delay(ASK_COOLDOWN_MILLIS)
+            waiting = false
+        }
+    }
+    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("🔒 El volumen lo maneja el conductor", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedButton(
+            onClick = {
+                onAsk()
+                waiting = true
+            },
+            enabled = !waiting,
+        ) { Text(if (waiting) "Pedido enviado…" else "Pedir más volumen 🙏") }
     }
 }
+
+private const val NOTICE_MILLIS = 6_000L
+private const val ASK_COOLDOWN_MILLIS = 30_000L
 
 /** Asks for the microphone permission (Android requires it for audio capture) and then for capture consent. */
 @Composable

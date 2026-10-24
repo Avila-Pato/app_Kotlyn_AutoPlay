@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -19,23 +20,38 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import org.example.autoplay.net.CarDiscovery
 import org.example.autoplay.net.DiscoveredCar
 import org.example.autoplay.net.Protocol
 import org.example.autoplay.session.JoinLink
 import javax.inject.Inject
 
-data class PairedDevice(val address: String, val name: String, val looksLikeCar: Boolean)
+data class PairedDevice(
+    val address: String,
+    val name: String,
+    val looksLikeCar: Boolean,
+    /** Linked right now for calls or music: the car is in range with Bluetooth on. */
+    val connected: Boolean = false,
+    /** When this phone last joined it through AutoPlay, 0 if never. */
+    val lastUsed: Long = 0,
+) {
+    /** Headphones, watches and TVs stay out of the way unless the user asks for them. */
+    val relevant: Boolean get() = connected || lastUsed > 0 || looksLikeCar
+}
 
 @HiltViewModel
 class PhoneViewModel @Inject constructor(
     private val client: PhoneClient,
+    private val knownCars: KnownCars,
     discovery: CarDiscovery,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     val status: StateFlow<PhoneStatus> = client.status
     val room: StateFlow<CarRoom?> = client.room
     val sharingAudio: StateFlow<Boolean> = client.sharingAudio
+    val notice: StateFlow<String?> = client.notice
+    val myCars: StateFlow<List<KnownCar>> = knownCars.cars
 
     val cars: StateFlow<List<DiscoveredCar>> =
         discovery.discover().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -50,6 +66,19 @@ class PhoneViewModel @Inject constructor(
     private val _pairedDevices = MutableStateFlow<List<PairedDevice>?>(null)
     val pairedDevices: StateFlow<List<PairedDevice>?> = _pairedDevices.asStateFlow()
 
+    init {
+        // Opening the app near a car it already knows reconnects without any taps
+        val last = knownCars.cars.value.firstOrNull()
+        if (last != null && !client.autoConnectDone && client.status.value == PhoneStatus.Disconnected) {
+            client.autoConnectDone = true
+            connectKnown(last)
+        }
+    }
+
+    fun connectKnown(car: KnownCar) = connect(car.target, code = "")
+
+    fun forgetCar(car: KnownCar) = knownCars.forget(car.id)
+
     fun onCodeChange(value: String) {
         _code.value = value.filter(Char::isDigit).take(6)
     }
@@ -60,27 +89,53 @@ class PhoneViewModel @Inject constructor(
 
     fun connectTo(car: DiscoveredCar) = connect(CarTarget.Wifi(car.host, car.port), _code.value)
 
-    fun connectBluetooth(device: PairedDevice) = connect(CarTarget.Bluetooth(device.address, device.name), _code.value)
+    /** No code over Bluetooth: pairing proves the phone is in the car, and the car still asks the driver. */
+    fun connectBluetooth(device: PairedDevice) = connect(CarTarget.Bluetooth(device.address, device.name), code = "")
 
     fun hasBluetoothPermission(): Boolean =
         Build.VERSION.SDK_INT < 31 ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
 
-    /** Car radios first: the head unit is usually already paired with the phone for calls. */
+    /** Connected now first, then the cars used most recently, then any other car radio. */
     @SuppressLint("MissingPermission") // checked by hasBluetoothPermission()
     fun refreshPairedDevices() {
         if (!hasBluetoothPermission()) return
         val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
         val bonded = runCatching { adapter?.bondedDevices.orEmpty() }.getOrDefault(emptySet())
+        val lastUsed = knownCars.cars.value
+            .mapNotNull { car -> (car.target as? CarTarget.Bluetooth)?.let { it.address to car.lastUsed } }
+            .toMap()
         _pairedDevices.value = bonded
             .map { device ->
                 val major = device.bluetoothClass?.majorDeviceClass
                 val isCar = device.bluetoothClass?.deviceClass == BluetoothClass.Device.AUDIO_VIDEO_CAR_AUDIO ||
                     major == BluetoothClass.Device.Major.AUDIO_VIDEO
-                PairedDevice(device.address, device.name ?: device.address, isCar)
+                PairedDevice(device.address, device.name ?: device.address, isCar, lastUsed = lastUsed[device.address] ?: 0)
             }
-            .sortedWith(compareByDescending<PairedDevice> { it.looksLikeCar }.thenBy { it.name })
+            .sortedWith(pairedOrder)
+
+        // Android cannot tell whether a paired device is in range, but the radio is usually
+        // already linked for calls or music when the car is on
+        for (profile in listOf(BluetoothProfile.A2DP, BluetoothProfile.HEADSET)) {
+            adapter?.getProfileProxy(context, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(type: Int, proxy: BluetoothProfile) {
+                    val addresses = runCatching { proxy.connectedDevices.map { it.address }.toSet() }.getOrDefault(emptySet())
+                    adapter.closeProfileProxy(type, proxy)
+                    if (addresses.isEmpty()) return
+                    _pairedDevices.update { list ->
+                        list?.map { if (it.address in addresses) it.copy(connected = true) else it }?.sortedWith(pairedOrder)
+                    }
+                }
+
+                override fun onServiceDisconnected(type: Int) {}
+            }, profile)
+        }
     }
+
+    private val pairedOrder = compareByDescending<PairedDevice> { it.connected }
+        .thenByDescending { it.lastUsed }
+        .thenByDescending { it.looksLikeCar }
+        .thenBy { it.name }
 
     /** Accepts `192.168.43.1` or `192.168.43.1:47800`. */
     fun connectManually() {
@@ -99,6 +154,8 @@ class PhoneViewModel @Inject constructor(
     fun shareAudio(resultCode: Int, data: Intent) = PhoneService.shareAudio(context, resultCode, data)
 
     fun setCarVolume(level: Int) = client.setCarVolume(level)
+    fun askForMoreVolume() = client.askForMoreVolume()
+    fun clearNotice() = client.clearNotice()
 
     fun disconnect() = client.disconnect()
 

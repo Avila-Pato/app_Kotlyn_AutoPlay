@@ -13,6 +13,10 @@ data class DeviceInfo(
     /** The phone granted audio capture, so it can play music in the car. */
     val sharing: Boolean,
     val bluetooth: Boolean = false,
+    /** The driver silenced this phone: the car skips its music. */
+    val muted: Boolean = false,
+    /** The driver keeps the volume to themself; this phone can only ask for more. */
+    val volumeLocked: Boolean = false,
 )
 
 /**
@@ -20,22 +24,45 @@ data class DeviceInfo(
  * Wire format of each frame: [type: 1 byte][payload length: 4 bytes][payload].
  */
 sealed interface Message {
-    /** Phone -> car: first contact with the 6-digit session code. */
-    data class Hello(val version: Int, val code: String, val deviceName: String) : Message
+    /**
+     * Phone -> car: first contact. [code] is the 6-digit session code; a phone the car approved before
+     * sends its [trust] token instead, and over Bluetooth the pairing itself replaces the code.
+     */
+    data class Hello(val version: Int, val code: String, val deviceName: String, val trust: String = "") : Message
 
     /** Phone -> car: reconnect after a dropped connection without asking for approval again. */
     data class Resume(val token: String) : Message
 
-    /** Car -> phone: the connection was approved; [token] allows resuming it later, [deviceId] names this phone. */
-    data class Accepted(val token: String, val carName: String, val deviceId: String) : Message
+    /**
+     * Car -> phone: the connection was approved; [token] allows resuming it later, [deviceId] names this phone,
+     * and [trust] lets it join this car ([carId]) next time without a code.
+     */
+    data class Accepted(
+        val token: String,
+        val carName: String,
+        val deviceId: String,
+        val carId: String = "",
+        val trust: String = "",
+    ) : Message
 
     data class Rejected(val reason: String) : Message
 
     /** Car -> phones: connected devices in priority order; the first online one that shares audio plays music. */
-    data class Roster(val devices: List<DeviceInfo>, val playingId: String?, val volume: Int = 100) : Message
+    data class Roster(
+        val devices: List<DeviceInfo>,
+        val playingId: String?,
+        val volume: Int = 100,
+        val carName: String = "",
+    ) : Message
 
     /** Phone playing music -> car: music volume in the car, 0..100. */
     data class Volume(val level: Int) : Message
+
+    /** Phone with a locked volume -> car: "turn it up, please". */
+    data object VolumeRequest : Message
+
+    /** Car -> phone: a short line from the driver, e.g. the answer to a [VolumeRequest]. */
+    data class Notice(val text: String) : Message
 
     /** Phone -> car: whether this phone is capturing its audio. */
     data class AudioState(val sharing: Boolean) : Message
@@ -76,7 +103,7 @@ object AudioSpec {
 }
 
 object Protocol {
-    const val VERSION = 3
+    const val VERSION = 4
     const val SERVICE_TYPE = "_autoplay._tcp."
     const val DEFAULT_PORT = 47800
 
@@ -97,6 +124,8 @@ object Protocol {
     private const val AUDIO = 10
     private const val AUDIO_AAC = 11
     private const val VOLUME = 12
+    private const val VOLUME_REQUEST = 13
+    private const val NOTICE = 14
 
     fun write(out: DataOutputStream, message: Message) {
         val (type, payload) = when (message) {
@@ -114,15 +143,17 @@ object Protocol {
     }
 
     private fun fieldsOf(message: Message): Pair<Int, List<String>> = when (message) {
-        is Message.Hello -> HELLO to listOf(message.version.toString(), message.code, message.deviceName)
+        is Message.Hello -> HELLO to listOf(message.version.toString(), message.code, message.deviceName, message.trust)
         is Message.Resume -> RESUME to listOf(message.token)
-        is Message.Accepted -> ACCEPTED to listOf(message.token, message.carName, message.deviceId)
+        is Message.Accepted -> ACCEPTED to listOf(message.token, message.carName, message.deviceId, message.carId, message.trust)
         is Message.Rejected -> REJECTED to listOf(message.reason)
-        is Message.Roster -> ROSTER to listOf(message.playingId ?: "", message.volume.toString()) + message.devices.flatMap {
-            listOf(it.id, it.name, flag(it.online), flag(it.sharing), flag(it.bluetooth))
+        is Message.Roster -> ROSTER to listOf(message.playingId ?: "", message.volume.toString(), message.carName) + message.devices.flatMap {
+            listOf(it.id, it.name, flag(it.online), flag(it.sharing), flag(it.bluetooth), flag(it.muted), flag(it.volumeLocked))
         }
         is Message.AudioState -> AUDIO_STATE to listOf(flag(message.sharing))
         is Message.Volume -> VOLUME to listOf(message.level.toString())
+        Message.VolumeRequest -> VOLUME_REQUEST to emptyList()
+        is Message.Notice -> NOTICE to listOf(message.text)
         is Message.Audio, is Message.AudioAac -> error("Audio is binary")
         Message.Ping -> PING to emptyList()
         Message.Pong -> PONG to emptyList()
@@ -141,18 +172,20 @@ object Protocol {
         fun field(i: Int) = fields.getOrNull(i) ?: throw IOException("Missing field $i in frame $type")
 
         return when (type) {
-            HELLO -> Message.Hello(field(0).toIntOrNull() ?: 0, field(1), field(2))
+            HELLO -> Message.Hello(field(0).toIntOrNull() ?: 0, field(1), field(2), fields.getOrNull(3).orEmpty())
             RESUME -> Message.Resume(field(0))
-            ACCEPTED -> Message.Accepted(field(0), field(1), field(2))
+            ACCEPTED -> Message.Accepted(field(0), field(1), field(2), fields.getOrNull(3).orEmpty(), fields.getOrNull(4).orEmpty())
             REJECTED -> Message.Rejected(field(0))
             ROSTER -> {
-                val devices = fields.drop(2).chunked(5).filter { it.size == 5 }.map { (id, name, online, sharing, bluetooth) ->
-                    DeviceInfo(id, name, online == "1", sharing == "1", bluetooth == "1")
+                val devices = fields.drop(3).chunked(7).filter { it.size == 7 }.map { f ->
+                    DeviceInfo(f[0], f[1], f[2] == "1", f[3] == "1", f[4] == "1", muted = f[5] == "1", volumeLocked = f[6] == "1")
                 }
-                Message.Roster(devices, field(0).ifEmpty { null }, field(1).toIntOrNull() ?: 100)
+                Message.Roster(devices, field(0).ifEmpty { null }, field(1).toIntOrNull() ?: 100, field(2))
             }
             AUDIO_STATE -> Message.AudioState(field(0) == "1")
             VOLUME -> Message.Volume(field(0).toIntOrNull()?.coerceIn(0, 100) ?: throw IOException("Bad volume"))
+            VOLUME_REQUEST -> Message.VolumeRequest
+            NOTICE -> Message.Notice(field(0))
             PING -> Message.Ping
             PONG -> Message.Pong
             BYE -> Message.Bye

@@ -44,7 +44,7 @@ class PhoneService : Service() {
     private var capture: AudioCapture? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
-    private var notificationText = "Conectando con el auto…" to ""
+    private var notificationText = "Conectando…" to ""
     private var playingInCar = false
     private lateinit var volume: CarVolumeRouter
 
@@ -171,14 +171,14 @@ class PhoneService : Service() {
     /** Title and text for the notification, or null when the session is over and the service should stop. */
     private fun describe(status: PhoneStatus, room: CarRoom?, sharing: Boolean): Pair<String, String>? = when (status) {
         PhoneStatus.Disconnected, is PhoneStatus.Failed -> null
-        PhoneStatus.Connecting -> "Conectando con el auto…" to ""
-        PhoneStatus.WaitingApproval -> "Esperando que el auto acepte…" to "Pulsa «Permitir» en la pantalla del auto"
-        is PhoneStatus.Reconnecting -> "Reconectando con ${status.carName}…" to "Se cortó la señal; volviendo a conectar"
-        is PhoneStatus.Connected -> "Estás conectado a ${status.carName}" to when {
-            room?.isPlaying == true -> "Tu música suena en el auto (volumen ${room.volume}%). Las teclas de volumen controlan el auto."
-            !sharing -> "Abre AutoPlay y toca «Activar audio» para poner música"
-            room?.playing != null -> "Ahora suena la música de ${room.playing?.name}"
-            else -> "Conectado"
+        PhoneStatus.Connecting -> "Conectando…" to ""
+        PhoneStatus.WaitingApproval -> "Esperando aprobación" to "Pulsa Permitir en el auto"
+        is PhoneStatus.Reconnecting -> "Reconectando…" to status.carName
+        is PhoneStatus.Connected -> status.carName to when {
+            room?.isPlaying == true -> "Sonando en el auto"
+            !sharing -> "Audio desactivado"
+            room?.playing != null -> "Suena ${room.playing?.name}"
+            else -> "En espera"
         }
     }
 

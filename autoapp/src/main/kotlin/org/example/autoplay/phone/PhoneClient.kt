@@ -61,12 +61,16 @@ data class CarRoom(
     val volume: Int = 100,
 ) {
     val isPlaying: Boolean get() = playingId == selfId
+    val self: DeviceInfo? get() = devices.find { it.id == selfId }
     val playing: DeviceInfo? get() = devices.find { it.id == playingId }
 }
 
 /** Phone side of a session: joins the car with a code, keeps the connection alive and streams audio. */
 @Singleton
-class PhoneClient @Inject constructor(@ApplicationContext private val context: Context) {
+class PhoneClient @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val knownCars: KnownCars,
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _status = MutableStateFlow<PhoneStatus>(PhoneStatus.Disconnected)
     val status: StateFlow<PhoneStatus> = _status.asStateFlow()
@@ -74,10 +78,17 @@ class PhoneClient @Inject constructor(@ApplicationContext private val context: C
     private val _room = MutableStateFlow<CarRoom?>(null)
     val room: StateFlow<CarRoom?> = _room.asStateFlow()
 
+    /** The driver's latest one-liner; the screen clears it after showing it. */
+    private val _notice = MutableStateFlow<String?>(null)
+    val notice: StateFlow<String?> = _notice.asStateFlow()
+
     private val _sharingAudio = MutableStateFlow(false)
     val sharingAudio: StateFlow<Boolean> = _sharingAudio.asStateFlow()
 
     private var job: Job? = null
+
+    /** The phone reconnects to its last car by itself only once per app start, not after the user leaves. */
+    var autoConnectDone = false
 
     @Volatile private var connection: Connection? = null
 
@@ -137,6 +148,13 @@ class PhoneClient @Inject constructor(@ApplicationContext private val context: C
         sendInBackground(Message.Volume(value))
     }
 
+    /** With the volume locked, all a passenger can do is ask nicely. */
+    fun askForMoreVolume() = sendInBackground(Message.VolumeRequest)
+
+    fun clearNotice() {
+        _notice.value = null
+    }
+
     private fun sendInBackground(message: Message) {
         val conn = connection ?: return
         scope.launch {
@@ -157,8 +175,9 @@ class PhoneClient @Inject constructor(@ApplicationContext private val context: C
             return publish(PhoneStatus.Failed("No se pudo conectar con ${target.label}$hint"))
         }
 
+        val trust = knownCars.trustFor(target)
         val accepted = try {
-            first.send(Message.Hello(Protocol.VERSION, code, deviceName))
+            first.send(Message.Hello(Protocol.VERSION, code, deviceName, trust))
             publish(PhoneStatus.WaitingApproval)
             first.readTimeoutMillis = APPROVAL_TIMEOUT_MILLIS
             first.receive()
@@ -168,8 +187,13 @@ class PhoneClient @Inject constructor(@ApplicationContext private val context: C
         }
         if (accepted !is Message.Accepted) {
             first.close()
+            // The car forgot us (the driver removed this phone): drop the stale token so the code is asked next time
+            if (trust.isNotEmpty() && accepted is Message.Rejected) knownCars.forgetTrust(trust)
             val reason = (accepted as? Message.Rejected)?.reason ?: "Respuesta inesperada del auto"
             return publish(PhoneStatus.Failed(reason))
+        }
+        if (accepted.carId.isNotEmpty() && accepted.trust.isNotEmpty()) {
+            knownCars.save(KnownCar(accepted.carId, accepted.carName, accepted.trust, target, System.currentTimeMillis()))
         }
         _room.value = CarRoom(accepted.deviceId)
 
@@ -208,8 +232,14 @@ class PhoneClient @Inject constructor(@ApplicationContext private val context: C
                 val message = conn.receive()
                 if (message == Message.Bye) break
                 // Pongs only keep the read timeout from firing
+                if (message is Message.Notice) _notice.value = message.text
                 if (message is Message.Roster) {
                     _room.value = _room.value?.copy(devices = message.devices, playingId = message.playingId, volume = message.volume)
+                    // The driver may rename the car while we are connected
+                    val current = _status.value
+                    if (message.carName.isNotEmpty() && current is PhoneStatus.Connected && current.carName != message.carName) {
+                        _status.value = PhoneStatus.Connected(message.carName)
+                    }
                 }
             }
             true

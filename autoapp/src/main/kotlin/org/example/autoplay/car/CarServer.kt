@@ -43,6 +43,9 @@ import javax.inject.Singleton
 /** A phone sent the right code; the driver must press "Permitir". */
 data class JoinRequest(val deviceName: String, val address: String?)
 
+/** A phone with a locked volume asked for more; the driver decides. */
+data class VolumeRequest(val deviceId: String, val deviceName: String)
+
 enum class CarBluetooth {
     /** This head unit has no Bluetooth that apps can use (some radios handle it in a separate module). */
     Unavailable,
@@ -53,6 +56,7 @@ enum class CarBluetooth {
 
 data class CarSessionState(
     val running: Boolean = false,
+    val carName: String = "",
     val code: String = "",
     val codeExpiresAt: Long = 0,
     val host: String? = null,
@@ -66,6 +70,7 @@ data class CarSessionState(
     val bluetoothName: String? = null,
     /** Music volume, 0..100; changed by the phone that plays or on the car screen. */
     val volume: Int = CarServer.DEFAULT_VOLUME,
+    val volumeRequest: VolumeRequest? = null,
 ) {
     val joinLink: JoinLink? get() = host?.takeIf { code.isNotEmpty() }?.let { JoinLink(it, port, code) }
     val playing: DeviceInfo? get() = devices.find { it.id == playingId }
@@ -81,11 +86,15 @@ class CarServer @Inject constructor(
     @ApplicationContext private val context: Context,
     private val discovery: CarDiscovery,
     private val player: AudioPlayer,
+    private val trustedPhones: TrustedPhones,
 ) {
-    private class Session(val id: String, val name: String, val token: String) {
+    private class Session(val id: String, val name: String, val token: String, val trust: String) {
         var connection: Connection? = null
         var sharing = false
         var bluetooth = false
+        var muted = false
+        var volumeLocked = false
+        var lastVolumeRequest = 0L
         var resumeTimeout: Job? = null
     }
 
@@ -129,7 +138,7 @@ class CarServer @Inject constructor(
         scope = newScope
         rosterChanged = Channel(Channel.CONFLATED)
 
-        _state.update { it.copy(running = true, host = localIpv4Address(), port = socket.localPort) }
+        _state.update { it.copy(running = true, carName = name, host = localIpv4Address(), port = socket.localPort) }
         newCode()
         newScope.launch { acceptLoop(socket) }
         newScope.launch { renewExpiredCodes() }
@@ -206,6 +215,18 @@ class CarServer @Inject constructor(
         rosterChanged.trySend(Unit)
     }
 
+    /** The driver renamed the car; phones see it in their next roster and nearby lists after re-announcing. */
+    fun rename(name: String) {
+        synchronized(lock) {
+            if (scope == null) return
+            carName = name
+            nsdHandle?.close()
+            nsdHandle = serverSocket?.let { discovery.register(name, it.localPort) }
+        }
+        _state.update { it.copy(carName = name) }
+        rosterChanged.trySend(Unit)
+    }
+
     fun setVolume(level: Int) {
         val value = level.coerceIn(0, 100)
         player.setGain(gainFor(value))
@@ -213,14 +234,55 @@ class CarServer @Inject constructor(
         rosterChanged.trySend(Unit)
     }
 
+    /** The driver silences a phone: its music stops and the next one in line plays. */
+    fun setMuted(deviceId: String, muted: Boolean) {
+        synchronized(lock) { sessions.find { it.id == deviceId }?.muted = muted }
+        rosterChanged.trySend(Unit)
+    }
+
+    /** A locked phone cannot move the car's volume, only ask for more. */
+    fun setVolumeLocked(deviceId: String, locked: Boolean) {
+        synchronized(lock) { sessions.find { it.id == deviceId }?.volumeLocked = locked }
+        rosterChanged.trySend(Unit)
+    }
+
+    /** The driver's answer to [CarSessionState.volumeRequest]; the phone gets a cheeky reply either way. */
+    fun answerVolumeRequest(accept: Boolean) {
+        val request = _state.value.volumeRequest ?: return
+        _state.update { it.copy(volumeRequest = null) }
+        if (accept) setVolume(_state.value.volume + VOLUME_REQUEST_STEP)
+        val connection = synchronized(lock) { sessions.find { it.id == request.deviceId }?.connection } ?: return
+        val reply = (if (accept) ACCEPTED_REPLIES else DENIED_REPLIES).random()
+        scope?.launch { runCatching { connection.send(Message.Notice(reply)) } }
+    }
+
+    private fun onVolumeRequest(session: Session) {
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            if (!session.volumeLocked || now - session.lastVolumeRequest < VOLUME_REQUEST_COOLDOWN_MILLIS) return
+            session.lastVolumeRequest = now
+        }
+        val request = VolumeRequest(session.id, session.name)
+        _state.update { it.copy(volumeRequest = request) }
+        // Nobody answered: the request quietly goes away
+        scope?.launch {
+            delay(VOLUME_REQUEST_TIMEOUT_MILLIS)
+            _state.update { if (it.volumeRequest === request) it.copy(volumeRequest = null) else it }
+        }
+    }
+
     /** Loudness feels roughly logarithmic, so a squared curve makes the slider steps feel even. */
     private fun gainFor(level: Int) = (level / 100f).let { it * it }
 
-    /** Disconnects a phone for good; it has to join again with a new code. */
-    fun remove(deviceId: String) {
+    /**
+     * Disconnects a phone. When the driver does it, [forget] also drops its trust,
+     * so it has to join again with a code.
+     */
+    fun remove(deviceId: String, forget: Boolean = false) {
         val connection = synchronized(lock) {
             val session = sessions.find { it.id == deviceId } ?: return
             sessions.remove(session)
+            if (forget) trustedPhones.forget(session.trust)
             session.resumeTimeout?.cancel()
             session.connection.also { session.connection = null }
         }
@@ -280,9 +342,11 @@ class CarServer @Inject constructor(
         var lastPlaying: String? = null
         for (signal in rosterChanged) {
             val (devices, playingId, connections) = synchronized(lock) {
-                val playing = sessions.firstOrNull { it.connection != null && it.sharing }
+                val playing = currentPlayerLocked()
                 Triple(
-                    sessions.map { DeviceInfo(it.id, it.name, it.connection != null, it.sharing, it.bluetooth) },
+                    sessions.map {
+                        DeviceInfo(it.id, it.name, it.connection != null, it.sharing, it.bluetooth, it.muted, it.volumeLocked)
+                    },
                     playing?.id,
                     sessions.mapNotNull { it.connection },
                 )
@@ -292,7 +356,7 @@ class CarServer @Inject constructor(
             if (playingId == null && lastPlaying != null) player.stop()
             lastPlaying = playingId
 
-            val roster = Message.Roster(devices, playingId, volume)
+            val roster = Message.Roster(devices, playingId, volume, synchronized(lock) { carName })
             connections.forEach { connection ->
                 try {
                     connection.send(roster)
@@ -322,12 +386,20 @@ class CarServer @Inject constructor(
         if (hello.version != Protocol.VERSION) {
             return connection.closeWith(Message.Rejected("Versión incompatible: actualiza la app en ambos equipos"))
         }
+        val trusted = trustedPhones.isTrusted(hello.trust)
+        // Bluetooth pairing already proved the phone is in the car; the driver still approves it
+        val needsCode = !trusted && !connection.isBluetooth
+        if (trusted) {
+            // The same phone is back (app restarted) while its old session waits to resume: replace it
+            synchronized(lock) { sessions.find { it.trust == hello.trust } }?.let { remove(it.id) }
+        }
         val decision = CompletableDeferred<Boolean>()
         val rejection = synchronized(lock) {
             when {
                 sessions.size >= MAX_DEVICES -> "El auto ya tiene $MAX_DEVICES celulares conectados"
+                trusted -> null
                 pendingDecision != null -> "El auto está atendiendo otra solicitud; intenta en unos segundos"
-                !code.redeem(hello.code, System.currentTimeMillis()) -> {
+                needsCode && !code.redeem(hello.code, System.currentTimeMillis()) -> {
                     failedAttempts++
                     "Código incorrecto o vencido"
                 }
@@ -343,20 +415,22 @@ class CarServer @Inject constructor(
             return connection.closeWith(Message.Rejected(rejection))
         }
 
-        _state.update { it.copy(request = JoinRequest(hello.deviceName, connection.remoteAddress)) }
-        val allowed = withTimeoutOrNull(APPROVAL_TIMEOUT_MILLIS) { decision.await() } ?: false
-        synchronized(lock) { pendingDecision = null }
-        _state.update { it.copy(request = null) }
-        newCode() // the old one was used; the next phone needs a fresh one
+        if (!trusted) {
+            _state.update { it.copy(request = JoinRequest(hello.deviceName, connection.remoteAddress)) }
+            val allowed = withTimeoutOrNull(APPROVAL_TIMEOUT_MILLIS) { decision.await() } ?: false
+            synchronized(lock) { pendingDecision = null }
+            _state.update { it.copy(request = null) }
+            if (needsCode) newCode() // the old one was used; the next phone needs a fresh one
+            if (!allowed) return connection.closeWith(Message.Rejected("El auto rechazó la conexión"))
+        }
 
-        if (!allowed) return connection.closeWith(Message.Rejected("El auto rechazó la conexión"))
-
+        val trust = if (trusted) hello.trust else trustedPhones.trust(hello.deviceName)
         val session = synchronized(lock) {
-            Session(SessionCode.newResumeToken().take(8), hello.deviceName, SessionCode.newResumeToken())
+            Session(SessionCode.newResumeToken().take(8), hello.deviceName, SessionCode.newResumeToken(), trust)
                 .also { sessions.add(it) }
         }
         try {
-            connection.send(Message.Accepted(session.token, carName, session.id))
+            connection.send(Message.Accepted(session.token, carName, session.id, trustedPhones.carId, trust))
         } catch (e: IOException) {
             connection.close()
             onConnectionLost(session)
@@ -375,7 +449,7 @@ class CarServer @Inject constructor(
             }
         } ?: return connection.closeWith(Message.Rejected("La sesión ya no existe; únete con un código nuevo"))
         try {
-            connection.send(Message.Accepted(session.token, carName, session.id))
+            connection.send(Message.Accepted(session.token, carName, session.id, trustedPhones.carId, session.trust))
         } catch (e: IOException) {
             connection.close()
             onConnectionLost(session)
@@ -403,7 +477,8 @@ class CarServer @Inject constructor(
                         aac.decode(message.frame) { pcm -> player.write(session.id, pcm) }
                     }
                     Message.Ping -> connection.send(Message.Pong)
-                    is Message.Volume -> if (isPlaying(session)) setVolume(message.level)
+                    is Message.Volume -> if (isPlaying(session) && !synchronized(lock) { session.volumeLocked }) setVolume(message.level)
+                    Message.VolumeRequest -> onVolumeRequest(session)
                     is Message.AudioState -> {
                         synchronized(lock) { session.sharing = message.sharing }
                         rosterChanged.trySend(Unit)
@@ -430,9 +505,9 @@ class CarServer @Inject constructor(
         if (endedByPhone) remove(session.id) else onConnectionLost(session)
     }
 
-    private fun isPlaying(session: Session) = synchronized(lock) {
-        sessions.firstOrNull { it.connection != null && it.sharing } === session
-    }
+    private fun isPlaying(session: Session) = synchronized(lock) { currentPlayerLocked() === session }
+
+    private fun currentPlayerLocked() = sessions.firstOrNull { it.connection != null && it.sharing && !it.muted }
 
     /** Keeps the phone's place for a while so it can come back with its resume token. */
     private fun onConnectionLost(session: Session) {
@@ -454,5 +529,20 @@ class CarServer @Inject constructor(
         private const val MAX_DEVICES = 8
         private const val MAX_FAILED_ATTEMPTS = 5
         private const val BLUETOOTH_RETRY_SECONDS = 5
+        private const val VOLUME_REQUEST_STEP = 10
+        private const val VOLUME_REQUEST_COOLDOWN_MILLIS = 30_000L
+        private const val VOLUME_REQUEST_TIMEOUT_MILLIS = 20_000L
+
+        private val ACCEPTED_REPLIES = listOf(
+            "¡Concedido! +10 de volumen 🎉",
+            "El conductor está de buen humor hoy 😄",
+            "Subido. No te acostumbres 😏",
+        )
+        private val DENIED_REPLIES = listOf(
+            "El conductor dijo que ni lo sueñes 😎",
+            "Mi auto, mis reglas 🚗",
+            "Rechazado por el DJ oficial 🎧",
+            "Los oídos del conductor agradecen tu comprensión 🙉",
+        )
     }
 }

@@ -1,7 +1,6 @@
 package org.example.autoplay.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,16 +13,27 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -33,11 +43,14 @@ import org.example.autoplay.net.DeviceInfo
 class DeviceActions(
     val onMove: (deviceId: String, position: Int) -> Unit,
     val onRemove: (deviceId: String) -> Unit,
+    val onMute: (deviceId: String, muted: Boolean) -> Unit,
+    val onLockVolume: (deviceId: String, locked: Boolean) -> Unit,
 )
 
 /**
  * Connected phones in priority order. The one playing music is highlighted; [selfId] marks
- * "this phone" on the phone side, and [actions] adds the priority controls on the car side.
+ * "this phone" on the phone side, and [actions] adds the driver's controls on the car side.
+ * Phones that dropped out wait folded at the bottom so they don't crowd the list.
  */
 @Composable
 fun DeviceList(
@@ -47,36 +60,42 @@ fun DeviceList(
     selfId: String? = null,
     actions: DeviceActions? = null,
 ) {
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "Dispositivos conectados",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                "${devices.count { it.online }} de ${devices.size}",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Conectados · ${devices.count { it.online }}",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         if (devices.isEmpty()) {
             Text(
-                "Todavía no hay celulares conectados.",
+                "Ningún celular por ahora",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        devices.forEachIndexed { index, device ->
+        val (online, offline) = devices.partition { it.online }
+        online.forEachIndexed { index, device ->
+            // Moves are positions in the full list, which still holds the phones that dropped out
             DeviceRow(
                 device = device,
-                position = index,
-                count = devices.size,
+                label = "${index + 1}",
                 playing = device.id == playingId,
                 isSelf = device.id == selfId,
                 actions = actions,
+                moveUp = online.getOrNull(index - 1)?.let { devices.indexOf(it) },
+                moveDown = online.getOrNull(index + 1)?.let { devices.indexOf(it) },
             )
+        }
+        if (offline.isNotEmpty()) {
+            var expanded by rememberSaveable { mutableStateOf(false) }
+            TextButton(onClick = { expanded = !expanded }) {
+                Text(if (expanded) "Ocultar reconectando" else "Reconectando (${offline.size})")
+            }
+            if (expanded) {
+                offline.forEach { device ->
+                    DeviceRow(device, label = "·", playing = false, isSelf = device.id == selfId, actions = actions, moveUp = null, moveDown = null)
+                }
+            }
         }
     }
 }
@@ -84,37 +103,32 @@ fun DeviceList(
 @Composable
 private fun DeviceRow(
     device: DeviceInfo,
-    position: Int,
-    count: Int,
+    label: String,
     playing: Boolean,
     isSelf: Boolean,
     actions: DeviceActions?,
+    moveUp: Int?,
+    moveDown: Int?,
 ) {
-    val accent = when {
-        playing -> AppColors.Success
-        !device.online -> AppColors.Warning
-        else -> MaterialTheme.colorScheme.primary
+    val (status, accent) = when {
+        playing -> "Sonando" to AppColors.Success
+        !device.online -> "Reconectando…" to AppColors.Warning
+        device.muted -> "Silenciado" to MaterialTheme.colorScheme.onSurfaceVariant
+        !device.sharing -> "Sin audio" to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> "En espera" to MaterialTheme.colorScheme.primary
     }
-    val (label, tone) = when {
-        playing -> "Sonando en el auto" to Tone.Success
-        !device.online -> "Reconectando…" to Tone.Warning
-        !device.sharing -> "Sin audio activado" to Tone.Neutral
-        else -> "En espera" to Tone.Progress
-    }
-    // Every row has the same two lines and the same controls, so the list reads as a table
+    // Every row has the same shape, so the list reads as a table
     Column(
         Modifier
             .fillMaxWidth()
             .clip(MaterialTheme.shapes.medium)
-            .background(if (playing) AppColors.Success.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceContainerHigh)
-            .border(1.dp, if (playing) AppColors.Success.copy(alpha = 0.5f) else Color.Transparent, MaterialTheme.shapes.medium)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .background(if (playing) AppColors.Success.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surfaceContainer)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            PriorityBadge(position + 1, accent)
-            IconBadge(if (playing) AppIcons.MusicNote else AppIcons.Smartphone, accent, size = 40.dp)
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            PriorityBadge(label, accent)
+            Column(Modifier.weight(1f)) {
                 Text(
                     if (isSelf) "${device.name} (tú)" else device.name,
                     style = MaterialTheme.typography.titleSmall,
@@ -123,45 +137,72 @@ private fun DeviceRow(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    if (device.bluetooth) "Por Bluetooth" else "Por Wi-Fi",
+                    "$status · ${if (device.bluetooth) "Bluetooth" else "Wi-Fi"}${if (device.volumeLocked) " · 🔒" else ""}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = accent,
                     maxLines = 1,
                 )
             }
-            StatusChip(label, tone)
+            if (playing) Icon(AppIcons.MusicNote, contentDescription = null, tint = AppColors.Success, modifier = Modifier.size(20.dp))
         }
         if (actions != null) {
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                FilledTonalButton(
+                TextButton(
                     onClick = { actions.onMove(device.id, 0) },
-                    enabled = !playing && device.online && device.sharing,
+                    enabled = !playing && device.online && device.sharing && !device.muted,
                     modifier = Modifier.weight(1f),
-                ) { Text(if (playing) "Está sonando" else "Poner su música", maxLines = 1) }
-                IconButton(onClick = { actions.onMove(device.id, position - 1) }, enabled = position > 0) {
-                    Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "Subir prioridad")
-                }
-                IconButton(onClick = { actions.onMove(device.id, position + 1) }, enabled = position < count - 1) {
-                    Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Bajar prioridad")
-                }
-                IconButton(onClick = { actions.onRemove(device.id) }) {
-                    Icon(Icons.Filled.Close, contentDescription = "Desconectar", tint = MaterialTheme.colorScheme.error)
-                }
+                ) { Text("Poner su música", maxLines = 1) }
+                DeviceMenu(device, actions, moveUp, moveDown)
             }
         }
     }
 }
 
+/** The driver's less frequent controls, out of sight until needed. */
 @Composable
-private fun PriorityBadge(number: Int, color: Color) {
+private fun DeviceMenu(device: DeviceInfo, actions: DeviceActions, moveUp: Int?, moveDown: Int?) {
+    var open by remember { mutableStateOf(false) }
+    val close = { open = false }
+    Box {
+        IconButton(onClick = { open = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Más opciones") }
+        DropdownMenu(expanded = open, onDismissRequest = close) {
+            MenuItem(
+                if (device.muted) "Quitar silencio" else "Silenciar",
+                if (device.muted) AppIcons.MusicNote else AppIcons.MusicOff,
+                close,
+            ) { actions.onMute(device.id, !device.muted) }
+            MenuItem(if (device.volumeLocked) "Devolver el volumen" else "Bloquear volumen", Icons.Filled.Lock, close) {
+                actions.onLockVolume(device.id, !device.volumeLocked)
+            }
+            moveUp?.let { MenuItem("Subir prioridad", Icons.Filled.KeyboardArrowUp, close) { actions.onMove(device.id, it) } }
+            moveDown?.let { MenuItem("Bajar prioridad", Icons.Filled.KeyboardArrowDown, close) { actions.onMove(device.id, it) } }
+            MenuItem("Desconectar", Icons.Filled.Close, close, MaterialTheme.colorScheme.error) { actions.onRemove(device.id) }
+        }
+    }
+}
+
+@Composable
+private fun MenuItem(text: String, icon: ImageVector, close: () -> Unit, tint: Color = Color.Unspecified, onClick: () -> Unit) {
+    DropdownMenuItem(
+        text = { Text(text, color = tint) },
+        leadingIcon = { Icon(icon, contentDescription = null, tint = if (tint == Color.Unspecified) LocalContentColor.current else tint) },
+        onClick = {
+            close()
+            onClick()
+        },
+    )
+}
+
+@Composable
+private fun PriorityBadge(label: String, color: Color) {
     Box(
         Modifier.size(28.dp).clip(CircleShape).background(color.copy(alpha = 0.18f)),
         contentAlignment = Alignment.Center,
     ) {
-        Text("$number", style = MaterialTheme.typography.labelLarge, color = color)
+        Text(label, style = MaterialTheme.typography.labelLarge, color = color)
     }
 }
